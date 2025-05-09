@@ -1,0 +1,164 @@
+# Configuration Settings for the Rover Rx
+
+# GNSS/INS Parameters
+septentrio_gnss_driver:
+  ros__parameters:
+    #device: serial:/dev/serial/by-id/usb-Septentrio_Septentrio_USB_Device_3687531-if02
+    device: tcp://192.168.2.60:28784
+    #device: serial:/dev/serial/by-id/usb-Septentrio_Septentrio_USB_Device_3687531-if02
+    
+    serial:
+      baudrate: 921600
+      hw_flow_control: "off"
+
+    stream_device:
+      tcp:
+        ip_server: ""
+        port: 0        
+      udp:
+        ip_server: ""
+        port: 0
+        unicast_ip: ""
+
+    configure_rx: true    
+
+    osnma:
+      mode: "off"
+      ntp_server: ""
+      keep_open: true
+
+    frame_id: gnss
+
+    imu_frame_id: imu
+
+    poi_frame_id: base_link
+
+    vsm_frame_id: vsm
+
+    aux1_frame_id: aux1
+
+    vehicle_frame_id: base_link
+
+    local_frame_id: odom
+
+    insert_local_frame: false
+
+    get_spatial_config_from_tf: false
+
+    lock_utm_zone: true
+
+    use_ros_axis_orientation: true
+
+    receiver_type: gnss    
+
+    multi_antenna: true
+
+    datum: Default
+
+    poi_to_arp:
+      delta_e: 0.0
+      delta_n: 0.0
+      delta_u: 0.0
+
+    att_offset:
+      heading: 0.0
+      pitch: 0.0
+      
+    ant_type: "AS-ANT3BCAL01 NONE"
+    ant_serial_nr: "Unknown"
+    ant_aux1_type: "AS-ANT3BCAL01 NONE"
+    ant_aux1_serial_nr: "Unknown"
+
+    polling_period:
+      pvt: 0
+      rest: 500
+
+    use_gnss_time: false
+
+    latency_compensation: true
+
+
+    publish:
+      # For both GNSS and INS Rxs
+      navsatfix: false
+      gpsfix: true
+      gpgga: false
+      gprmc: false
+      gpst: false
+      measepoch: false
+      pvtcartesian: false
+      pvtgeodetic: false
+      basevectorcart: false
+      basevectorgeod: false
+      poscovcartesian: false
+      poscovgeodetic: false
+      velcovcartesian: false
+      velcovgeodetic: false
+      atteuler: false
+      attcoveuler: false
+      pose: false
+      twist: false
+      diagnostics: false
+      aimplusstatus: false
+      galauthstatus: false
+      # For GNSS Rx only
+      gpgsa: false
+      gpgsv: false
+      # For INS Rx only
+      insnavcart: false
+      insnavgeod: false
+      extsensormeas: false
+      imusetup: false
+      velsensorsetup: false
+      exteventinsnavcart: false
+      exteventinsnavgeod: false
+      imu: false
+      localization: false
+      tf: false
+      
+    # INS-Specific Parameters
+
+    ins_spatial_config:
+      imu_orientation:
+        theta_x: 0.0
+        theta_y: 0.0
+        theta_z: 0.0
+      poi_to_imu:
+        delta_x: 0.0
+        delta_y: 0.0
+        delta_z: 0.0
+      ant_lever_arm:
+        x: 0.0
+        y: 0.0
+        z: 0.0
+      vsm_lever_arm:
+        vsm_x: 0.0
+        vsm_y: 0.0
+        vsm_z: 0.0
+
+    ins_initial_heading: auto
+
+    ins_std_dev_mask:
+      att_std_dev: 5.0
+      pos_std_dev: 10.0
+
+    ins_use_poi: false
+
+    ins_vsm:
+      ros:
+        source: ""
+        config: [false, false, false]
+        variances_by_parameter: false
+        variances: [0.0, 0.0, 0.0]
+      ip_server:
+        id: ""
+        port: 0
+        keep_open: true
+      serial:
+        port: ""
+        baud_rate: 115200
+        keep_open: true
+
+    # logger
+
+    activate_debug_log: false

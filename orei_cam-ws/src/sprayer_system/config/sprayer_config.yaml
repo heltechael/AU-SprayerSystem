@@ -1,0 +1,83 @@
+sprayer_control_node:
+  ros__parameters:
+
+    # === ROS Communication ===
+    input_topic: "/vision_system/tracked_objects"
+    gps_topic: "/gpsfix"
+    control_loop_frequency: 128.0
+
+    # === Node Behavior ===
+    log_received_messages: false
+
+    # === Camera Parameters ===
+    camera_parameters:
+      image_width_px: 2464
+      image_height_px: 2144 #1408
+      #gsd_px_per_meter: 2898.8 # 2464px / (850mm / 1000 mm/m)
+      gsd_px_per_meter: 2209.86 # 2464px / (1115mm / 1000 mm/m) (img_width measured to 111.5cm in test-setup)
+
+    # === Motion Model ===
+    motion_model:
+      playback_speed_factor: 1.0
+      # --- GPS Fallback Configuration ---
+      gps_staleness_threshold_sec: 1.0 # Max time (s) since last GPS msg before considered stale - set <= 0 to disable check
+
+    # === Spraying Strategy ===
+    strategy:
+      type: "simple_weed"
+      simple_weed:
+        crop_class_names: ["PIBSA"] # avoid these classes - should probably be hardcoded in strategy instead of here
+        min_confidence: 0.0
+        min_target_coverage_ratio: 1.0
+        max_nontarget_overspray_ratio: 1.0
+      spray_all:
+        min_confidence: 0.0
+        min_target_coverage_ratio: 1.0
+        max_nontarget_overspray_ratio: 1.0
+
+    # === Nozzle Layout ===
+    nozzle_layout:
+      num_nozzles: 25
+      calibration_file: "/home/orei/orei-cam_ws/src/sprayer_system/config/pruned_nozzle_calibration_small.yaml"
+      activation_zone_target_width_px: -1.0  # Example: 20.0 to target a 20px width
+      activation_zone_target_height_px: 1.0 #20.0 # Example: 50.0 to target a 50px height
+
+    # === Timing (Placeholder - For Planning Stage) ===
+    timing:
+      nozzle_actuation_latency: 0.200 # in s (0.008=8ms)
+      spray_margin_time: 0.00         # Seconds, like padding the bounding box with additional before/after spray
+ 
+    # === Object Management === 
+    object_management:
+      keep_lost_objects_on_screen: false
+      activation_zone_object_width_px: 5.0
+        
+    # === Hardware Interface ===
+    hardware_interface:
+      type: "serial_relay" # "serial_relay" or "dummy"
+      serial_relay:
+        port: "/dev/ttyNC0" # UPDATE THIS 
+        baudrate: 9600
+        total_relays: 32     # Total bits the microcontroller expects
+
+    # === Debugging ===
+    debug:
+      enable_gui: true
+      gui_update_rate: 128.0 # does not have to match main loop freq, could be 24/30/60 etc
+      gui_window_name: "Sprayer Debug"
+      gui_width: 1232                  # Width for the top image view 
+      gui_height: 1067 #704            # Height for the top image view panel
+      
+      # object Visualization 
+      gui_object_fill_opacity: 0.4      # Opacity for general status fill
+      gui_spray_fill_opacity: 0.6       # Opacity for object fill when SPRAYING
+
+      # common gui params
+      gui_text_color: [255, 255, 255]
+      gui_font_scale: 0.5
+      gui_font_thickness: 1
+
+      # ------- spray history stuff - NOT YET IMPLEMENTED ---------
+      gui_spray_history_length: 500     # Max number of spray events to store/draw
+      gui_spray_color: [200, 150, 0]    # Spray color (BGR)
+      gui_spray_history_opacity: 0.6    # Opacity for ground spray history (0.0-1.0)

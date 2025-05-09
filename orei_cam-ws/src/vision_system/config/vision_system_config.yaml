@@ -1,0 +1,96 @@
+vision_processing_node:
+  ros__parameters:
+
+    # === Threading/Processing Lock ===
+    threading:
+      max_workers: 8
+
+    # === Image Processing ===
+    image_processing:
+      resize_width: 2464 # 5320
+      resize_height: 1600 # 4600
+
+    # === Motion Estimation ===
+    motion_estimation:
+      estimator_type: "orb_homography" # or "sparse_lk"
+      # --- ORB Homography Parameters ---
+      orb_homography:
+        num_features: 2000         
+        fast_threshold: 5         # Difference in intensity between a center pixel and pixels in a circular ring around it
+                                  # Higher value means only very sharp, high-contrast corners are detected
+                                  # Default in OpenCV: 20
+        knn_k: 2
+        lowe_ratio: 0.80 # 0.75
+        ransac_threshold: 10.0 # 10
+        min_good_matches: 5
+      # --- Sparse LK Parameters ---
+      sparse_lk:
+        max_corners: 500           # Max Shi-Tomasi corners to detect
+        quality_level: 0.05        # Quality level for Shi-Tomasi corners
+        min_distance: 10           # Minimum distance between corners
+        block_size: 7              # Block size for corner detection
+        lk_window_size: 21         # LK optical flow window size (odd number > 1)
+        lk_pyramid_levels: 3       # LK pyramid levels
+        lk_max_iterations: 30      # LK max iterations
+        lk_epsilon: 0.01           # LK termination epsilon
+        min_tracked_points: 20     # Min points needed to trust LK flow result
+
+    # === Inference ===
+    inference:
+      model_path: "/media/OREI-cam/model_file/cropweed_best_27epoch.engine"
+      device: "cuda:0"
+      confidence_threshold: 0.25
+      iou_threshold: 0.4
+      max_detections: 1500
+      use_half_precision: true 
+      agnostic_nms: false
+      verbose: false
+
+    # === Model Metadata ===
+    model_metadata:
+      beet_class_name: "BEAVA"
+      psez_class_name: "PSEZ" 
+
+    # === Object Tracking ===
+    tracking:
+      enabled: true                        # Enable/disable tracking globally
+      max_age: 5                           # Max frames a track can be missing before removal
+      vertical_match_tolerance_px: 40.0    # Base tolerance in Y for matching cost calculation
+      horizontal_match_tolerance_px: 40.0  # Base tolerance in X for matching cost calculation
+      validation_tolerance_factor: 1.5     # e.g., 1.5 allows checking matches up to 1.5*tolerance away
+      distance_penalty_threshold_factor: 2.0 # e.g., 2.0 = start penalty scaling if distance > 2 * base_tolerance
+      close_to_edge_threshold_px: 10       # BBox distance from image edge to be considered 'near edge'
+      bbox_touching_edge_weight: 0.25      # Confidence weight reduction factor for detections near the edge (used in get_predicted_class)
+      lock_beets_with_psez: true           # Lock track class to Crop if associated PSEZ detected
+
+      weight_costs:
+        position: 1.0          # Cost based on deviation from predicted position (vertical focus in experimental)
+        area: 0.5              # Cost based on bounding box area change ratio
+        aspect: 0.5            # Cost based on bounding box aspect ratio change
+        class_consistency: 0.8 # Cost penalty for class changes (especially if locked)
+        horizontal: 0.3        # Additional weighted cost specifically for horizontal deviation
+
+      min_confidence_for_new_track: 0.30 # Minimum detection confidence to start a new track
+
+    # === Node Behavior ===
+    input_topic: "images"
+    output_topic: "/vision_system/tracked_objects"
+
+    # === Debugging ===
+    debug:
+      save_annotated_images: false      # Save images with motion vector, detections, and tracks
+      save_image_path: "/media/OREI-cam/vision_system_debug_output/"
+      log_parallelism_details: false 
+
+      # --- Visualization Parameters (for debug images only) ---
+      visualization:
+        draw_track_ids: true           # Draw track ID and predicted class/confidence
+        draw_track_trails: true        # Draw historical path of tracks
+        trail_length: 15               # Number of historical points to show in the trail
+        trail_color: [255, 0, 255]     # Trail color (RGB - Magenta default)
+        trail_thickness: 1             # Trail line thickness
+        track_id_color: [0, 255, 255]  # Track ID text color (RGB - Cyan default)
+        track_id_font_scale: 0.5       # Font scale for track ID
+        track_id_font_thickness: 1     # Thickness for track ID text
+        track_id_offset_x: 5           # Horizontal offset from top-left corner of bbox
+        track_id_offset_y: -10         # Vertical offset (negative means above bbox)

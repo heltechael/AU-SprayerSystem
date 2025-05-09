@@ -1,0 +1,277 @@
+Project Path: /home/orei/orei-cam_ws/src/camera_trigger
+
+Source Tree:
+
+```
+camera_trigger
+├── resource
+│   └── camera_trigger
+├── setup.cfg
+├── camera_trigger
+│   ├── camera_trigger.py
+│   └── __init__.py
+├── package.xml
+├── test
+│   ├── test_pep257.py
+│   ├── test_copyright.py
+│   └── test_flake8.py
+└── setup.py
+
+```
+
+`/home/orei/orei-cam_ws/src/camera_trigger/setup.cfg`:
+
+```````cfg
+[develop]
+script_dir=$base/lib/camera_trigger
+[install]
+install_scripts=$base/lib/camera_trigger
+
+```````
+
+`/home/orei/orei-cam_ws/src/camera_trigger/camera_trigger/camera_trigger.py`:
+
+```````py
+import rclpy
+from rclpy.node import Node
+from rclpy.time import Time
+
+from std_msgs.msg import String
+from rosidl_runtime_py import message_to_ordereddict
+
+
+import os
+
+
+import time
+
+from arena_api.callback import callback, callback_function
+from arena_api.system import system
+
+from arena_api import enums
+import numpy as np
+from datetime import datetime
+from gps_msgs.msg import GPSFix
+from std_msgs.msg import Empty
+from geopy import distance
+
+
+
+class camera_trigger(Node):
+
+    def __init__(self):
+        super().__init__('camera_trigger')
+        #self.publisher_ = self.create_publisher(String, 'topic', 10)
+        #timer_period = 0.5  # seconds
+        #self.timer = self.create_timer(timer_period, self.timer_callback)
+        #self.i = 0
+        self.previous_trigger_position = None
+        self.time_at_start = datetime.now()
+        self.time_at_last_trigger = datetime.now()
+        # Create a device
+
+        self.gps_subscription = self.create_subscription(
+                    GPSFix,
+                    'gpsfix',
+                    self.gps_callback,
+                    10)
+
+        self.trigger_publisher = self.create_publisher(Empty, 'trigger', 10)
+    
+    def date_diff_in_Seconds(self, dt2, dt1):
+        # Calculate the time difference between dt2 and dt1
+        timedelta = dt2 - dt1
+        # Return the total time difference in seconds
+        return timedelta.total_seconds() #timedelta.days * 24 * 3600 + timedelta.seconds    
+
+    def gps_callback(self, msg):
+        #print("received gps msg..")
+        if((msg.latitude > 90) or (msg.latitude < -90) or (msg.longitude > 90) or (msg.longitude < -90)):
+            print("no gps reception..")
+            #print(str(self.date_diff_in_Seconds(datetime.now(), self.time_at_start)))
+            if ( self.date_diff_in_Seconds(datetime.now(), self.time_at_start) < 60):
+                if ( self.date_diff_in_Seconds(datetime.now(), self.time_at_last_trigger) > 2):
+                    self.time_at_last_trigger = datetime.now()
+                    self.trigger_publisher.publish(Empty())
+            
+            return -1
+        if(self.previous_trigger_position == None):
+            self.previous_trigger_position = msg
+            self.trigger_publisher.publish(Empty())
+        else:
+            if ( self.date_diff_in_Seconds(datetime.now(), self.time_at_last_trigger) > 0.15):  #was 0.15 for orei sampling   was 0.125 for first farmdroid sampling
+                distance_since_last_trigger = distance.great_circle((self.previous_trigger_position.latitude, self.previous_trigger_position.longitude), (msg.latitude, msg.longitude)).m
+                if(distance_since_last_trigger > 0.15):  #was 0.35 for orei sampling   was 0.05 for first farmdroid sampling
+                    print("Triggering camera..")
+                    self.previous_trigger_position = msg
+                    self.time_at_last_trigger = datetime.now()
+                    self.trigger_publisher.publish(Empty())
+                print(distance_since_last_trigger)
+            
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    camera_trigger_instance = camera_trigger()
+    
+    #camera_trigger.run()
+    rclpy.spin(camera_trigger_instance)
+
+    # Destroy the node explicitly
+    # (optional - otherwise it will be done automatically
+    # when the garbage collector destroys the node object)
+    camera_trigger_instance.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+
+```````
+
+`/home/orei/orei-cam_ws/src/camera_trigger/package.xml`:
+
+```````xml
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>camera_trigger</name>
+  <version>0.0.0</version>
+  <description>TODO: Package description</description>
+  <maintainer email="orei@todo.todo">orei</maintainer>
+  <license>TODO: License declaration</license>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
+
+```````
+
+`/home/orei/orei-cam_ws/src/camera_trigger/test/test_pep257.py`:
+
+```````py
+# Copyright 2015 Open Source Robotics Foundation, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from ament_pep257.main import main
+import pytest
+
+
+@pytest.mark.linter
+@pytest.mark.pep257
+def test_pep257():
+    rc = main(argv=['.', 'test'])
+    assert rc == 0, 'Found code style errors / warnings'
+
+```````
+
+`/home/orei/orei-cam_ws/src/camera_trigger/test/test_copyright.py`:
+
+```````py
+# Copyright 2015 Open Source Robotics Foundation, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from ament_copyright.main import main
+import pytest
+
+
+# Remove the `skip` decorator once the source file(s) have a copyright header
+@pytest.mark.skip(reason='No copyright header has been placed in the generated source file.')
+@pytest.mark.copyright
+@pytest.mark.linter
+def test_copyright():
+    rc = main(argv=['.', 'test'])
+    assert rc == 0, 'Found errors'
+
+```````
+
+`/home/orei/orei-cam_ws/src/camera_trigger/test/test_flake8.py`:
+
+```````py
+# Copyright 2017 Open Source Robotics Foundation, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from ament_flake8.main import main_with_errors
+import pytest
+
+
+@pytest.mark.flake8
+@pytest.mark.linter
+def test_flake8():
+    rc, errors = main_with_errors(argv=[])
+    assert rc == 0, \
+        'Found %d code style errors / warnings:\n' % len(errors) + \
+        '\n'.join(errors)
+
+```````
+
+`/home/orei/orei-cam_ws/src/camera_trigger/setup.py`:
+
+```````py
+from setuptools import find_packages, setup
+
+package_name = 'camera_trigger'
+
+setup(
+    name=package_name,
+    version='0.0.0',
+    packages=find_packages(exclude=['test']),
+    data_files=[
+        ('share/ament_index/resource_index/packages',
+            ['resource/' + package_name]),
+        ('share/' + package_name, ['package.xml']),
+    ],
+    install_requires=['setuptools'],
+    zip_safe=True,
+    maintainer='orei',
+    maintainer_email='orei@todo.todo',
+    description='TODO: Package description',
+    license='TODO: License declaration',
+    tests_require=['pytest'],
+    entry_points={
+        'console_scripts': [
+            'camera_trigger = camera_trigger.camera_trigger:main'
+        ],
+    },
+)
+
+```````
