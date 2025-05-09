@@ -8,9 +8,9 @@ The primary goal is to detect plants (crops and weeds) in real-world field condi
 
 The system is modular, with key functionalities encapsulated in dedicated ROS 2 packages:
 
-1.  **`vision_system`**: Performs image acquisition, preprocessing, motion estimation (frame-to-frame displacement), YOLOv11-based object detection, PSEZ-crop matching, and robust object tracking.
+1.  **`vision_system`**: Performs image acquisition, preprocessing, motion estimation (frame-to-frame displacement), YOLOv11-based object detection, PSEZ-crop matching, and object tracking.
 2.  **`sprayer_system`**: Manages detected objects, applies spraying strategies, predicts object ground positions, schedules nozzle activations considering latencies, and interfaces with the sprayer hardware.
-3.  **Supporting Camera & Sensor Packages**:
+3.  **Camera & Sensor Packages**:
     *   `camera_node_front`: Interfaces with the physical camera, handles triggering and image metadata.
     *   `camera_trigger`: Generates camera trigger signals based on GPS movement.
     *   `camera_height`: Estimates camera height above ground using LiDAR data.

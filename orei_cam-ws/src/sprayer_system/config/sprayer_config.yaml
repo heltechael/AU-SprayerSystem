@@ -24,23 +24,24 @@ sprayer_control_node:
 
     # === Spraying Strategy ===
     strategy:
-      type: "simple_weed"
+      type: "simple_weed" # Default strategy
       simple_weed:
-        crop_class_names: ["PIBSA"] # avoid these classes - should probably be hardcoded in strategy instead of here
+        crop_class_names: ["BEAVA", "ZEAMX", "SOLTU"]
         min_confidence: 0.0
-        min_target_coverage_ratio: 1.0
-        max_nontarget_overspray_ratio: 1.0
+        min_target_coverage_ratio: 1.0 # NOT IMPLEMENTED CURRENTLY
+        max_nontarget_overspray_ratio: 1.0 # NOT IMPLEMENTED CURRENTLY
+        safety_zone_in_cm: 5.0 # 5cm safety zone for crop_class_names
       spray_all:
         min_confidence: 0.0
-        min_target_coverage_ratio: 1.0
-        max_nontarget_overspray_ratio: 1.0
+        min_target_coverage_ratio: 1.0 # NOT IMPLEMENTED CURRENTLY
+        max_nontarget_overspray_ratio: 1.0 # NOT IMPLEMENTED CURRENTLY
 
     # === Nozzle Layout ===
     nozzle_layout:
       num_nozzles: 25
       calibration_file: "/home/orei/orei-cam_ws/src/sprayer_system/config/pruned_nozzle_calibration_small.yaml"
-      activation_zone_target_width_px: -1.0  # Example: 20.0 to target a 20px width
-      activation_zone_target_height_px: 1.0 #20.0 # Example: 50.0 to target a 50px height
+      activation_zone_target_width_px: -1.0  # e.g 20.0 to target a 20px width
+      activation_zone_target_height_px: 1.0 # Example: 5.0 to target a 5px height
 
     # === Timing (Placeholder - For Planning Stage) ===
     timing:
