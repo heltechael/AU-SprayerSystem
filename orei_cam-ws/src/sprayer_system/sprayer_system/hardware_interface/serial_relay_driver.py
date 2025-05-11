@@ -133,6 +133,7 @@ class SerialRelayInterface(BaseHardwareInterface):
         else:
              self._logger.error("Failed to send combined nozzle state command.")
              self._last_sent_combined_state = None 
+        return combined_state_int
 
     def _format_command(self, hex_payload: str) -> Optional[bytes]:
         if len(hex_payload) != self.EXPECTED_HEX_PAYLOAD_LENGTH:

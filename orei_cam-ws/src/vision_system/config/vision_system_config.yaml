@@ -78,7 +78,7 @@ vision_processing_node:
 
     # === Debugging ===
     debug:
-      save_annotated_images: false      # Save images with motion vector, detections, and tracks
+      save_annotated_images: true      # Save images with motion vector, detections, and tracks
       save_image_path: "/media/OREI-cam/vision_system_debug_output/"
       log_parallelism_details: false 
 
