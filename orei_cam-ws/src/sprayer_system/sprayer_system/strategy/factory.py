@@ -4,8 +4,9 @@ import traceback
 from rclpy.clock import Clock
 from .base_strategy import BaseSprayStrategy
 from .simple_weed_strategy import SimpleWeedStrategy
-from .spray_all_strategy import SprayAllStrategy 
-from .macro_strategy import MarcoStrategy 
+from .spray_all_strategy import SprayAllStrategy
+from .macro_strategy import MarcoStrategy
+from .no_spray_strategy import NoSprayStrategy
 
 # Import other strategies here, e.g. MarcoStrat{2/3/4}
 
@@ -26,15 +27,21 @@ def create_spraying_strategy(strategy_config: Dict[str, Any], logger: logging.Lo
             if not config_for_simple: logger.warning(f"No config under 'strategy.simple_weed'.")
             return SimpleWeedStrategy(config_for_simple, logger, clock)
 
-        elif strategy_type_lower == "spray_all": 
+        elif strategy_type_lower == "spray_all":
             config_for_spray_all = strategy_config.get('spray_all', {})
             if not config_for_spray_all: logger.warning(f"No config under 'strategy.spray_all'.")
             return SprayAllStrategy(config_for_spray_all, logger, clock)
-        
-        elif strategy_type_lower == "macro_strategy": 
-            config_for_spray_all = strategy_config.get('macro_strategy', {})
-            if not config_for_spray_all: logger.warning(f"No config under 'strategy.macro_strategy'.")
-            return SprayAllStrategy(config_for_spray_all, logger, clock)
+
+        elif strategy_type_lower == "macro_strategy":
+            config_for_macro = strategy_config.get('macro_strategy', {})
+            if not config_for_macro: logger.warning(f"No config under 'strategy.macro_strategy'.")
+            return MarcoStrategy(config_for_macro, logger, clock)
+
+        elif strategy_type_lower == "no_spray":
+            config_for_no_spray = strategy_config.get('no_spray', {}) # Allows for future config if needed
+            if not config_for_no_spray: logger.debug(f"No specific config under 'strategy.no_spray', using defaults.")
+            return NoSprayStrategy(config_for_no_spray, logger, clock)
+
 
         # --- Add other strategies here ---
         # elif strategy_type_lower == "marco_strat1":

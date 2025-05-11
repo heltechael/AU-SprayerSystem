@@ -2,22 +2,23 @@
 
 import rclpy
 from rclpy.node import Node
-from rclpy.parameter import Parameter 
+from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy, qos_profile_sensor_data
-from rclpy.time import Time 
-from rclpy.exceptions import ParameterException 
+from rclpy.time import Time
+from rclpy.exceptions import ParameterException
 
 from vision_interfaces.msg import TrackingResults
 from gps_msgs.msg import GPSFix
+from std_msgs.msg import String as StringMsg 
 
-from .common.definitions import DisplayObjectState, CameraParams, ObjectStatus, ManagedObject 
+from .common.definitions import DisplayObjectState, CameraParams, ObjectStatus, ManagedObject
 from .visualization import DebugGui, OPENCV_AVAILABLE
 from .motion import MotionModel
 from .object_management import ObjectManager
 from .strategy import create_spraying_strategy, BaseSprayStrategy
 from .planning import NozzleConfiguration, NozzleMapper, SprayScheduler
 from .hardware_interface import create_hardware_interface, BaseHardwareInterface
-from .hardware_interface.serial_relay_driver import SerialRelayInterface 
+from .hardware_interface.serial_relay_driver import SerialRelayInterface
 
 import traceback
 import threading
@@ -40,15 +41,22 @@ class SprayerNode(Node):
         self.control_timer: Optional[rclpy.timer.Timer] = None
         self.tracking_subscription = None
         self.gps_subscription = None
+        self.spraying_state_subscription = None
         self.camera_params: Optional[CameraParams] = None
         self._strategy_update_lock = threading.Lock()
         self.spray_scheduler: Optional[SprayScheduler] = None
         self.hardware_interface: Optional[BaseHardwareInterface] = None
+        self._default_strategy_type: Optional[str] = None
+
 
         try:
             self._declare_parameters()
             self.config = self._load_parameters()
             self._log_messages = self.config.get('log_received_messages', False)
+            self._default_strategy_type = self.config.get('strategy', {}).get('type')
+            if not self._default_strategy_type:
+                self.get_logger().warn("Default strategy type not found in config. Fallback may not work as expected.")
+
             self._validate_and_create_cam_params(self.config.get('camera_parameters', {}))
 
             gui_enabled = self.config.get('debug', {}).get('enable_gui', False)
@@ -103,11 +111,11 @@ class SprayerNode(Node):
 
             self.nozzle_mapper = NozzleMapper(self.nozzle_config, self.get_logger())
             self.object_manager = ObjectManager(
-                config=self.config, 
+                config=self.config,
                 motion_model=self.motion_model,
-                cam_params=self.camera_params, 
+                cam_params=self.camera_params,
                 initial_strategy=self.strategy,
-                logger=self.get_logger(), 
+                logger=self.get_logger(),
                 clock=self.get_clock()
             )
             timing_config = self.config.get('timing', {})
@@ -140,12 +148,13 @@ class SprayerNode(Node):
     def _declare_parameters(self):
         self.declare_parameter('input_topic', '/vision_system/tracked_objects')
         self.declare_parameter('gps_topic', '/gpsfix')
+        self.declare_parameter('spraying_state_topic', '/sprayingState')
         self.declare_parameter('control_loop_frequency', 128.0)
         self.declare_parameter('log_received_messages', False)
 
         # Camera
         self.declare_parameter('camera_parameters.image_width_px', 2464)
-        self.declare_parameter('camera_parameters.image_height_px', 2144) 
+        self.declare_parameter('camera_parameters.image_height_px', 2144)
         self.declare_parameter('camera_parameters.gsd_px_per_meter', 2209.86)
 
         # Motion
@@ -163,7 +172,7 @@ class SprayerNode(Node):
         self.declare_parameter('debug.gui_font_thickness', 1)
         self.declare_parameter('debug.gui_object_fill_opacity', 0.4)
         self.declare_parameter('debug.gui_spray_fill_opacity', 0.6)
-        self.declare_parameter('debug.gui_object_activation_zone_color', [100, 255, 100]) 
+        self.declare_parameter('debug.gui_object_activation_zone_color', [100, 255, 100])
 
         # Strategy
         self.declare_parameter('strategy.type', 'simple_weed')
@@ -171,22 +180,20 @@ class SprayerNode(Node):
         self.declare_parameter('strategy.simple_weed.min_confidence', 0.0)
         self.declare_parameter('strategy.simple_weed.min_target_coverage_ratio', 1.0)
         self.declare_parameter('strategy.simple_weed.max_nontarget_overspray_ratio', 1.0)
-        self.declare_parameter('strategy.simple_weed.safety_zone_in_cm', 0.0) 
+        self.declare_parameter('strategy.simple_weed.safety_zone_in_cm', 0.0)
 
         self.declare_parameter('strategy.spray_all.min_confidence', 0.0)
         self.declare_parameter('strategy.spray_all.min_target_coverage_ratio', 1.0)
         self.declare_parameter('strategy.spray_all.max_nontarget_overspray_ratio', 1.0)
-        # self.declare_parameter('strategy.spray_all.safety_zone_in_cm', 0.0)
 
         self.declare_parameter('strategy.macro_strategy.confidence_threshold', 0.4)
         self.declare_parameter('strategy.macro_strategy.size_threshold_m', 0.04)
         self.declare_parameter('strategy.macro_strategy.min_target_coverage_ratio', 0.9)
         self.declare_parameter('strategy.macro_strategy.max_nontarget_overspray_ratio', 0.1)
-        # self.declare_parameter('strategy.macro_strategy.safety_zone_in_cm', 0.0) 
 
         # Nozzle Layout
         self.declare_parameter('nozzle_layout.num_nozzles', 25)
-        self.declare_parameter('nozzle_layout.calibration_file', "") 
+        self.declare_parameter('nozzle_layout.calibration_file', "")
         self.declare_parameter('nozzle_layout.placeholder', True)
         self.declare_parameter('nozzle_layout.default_spacing_cm', 4.0)
         self.declare_parameter('nozzle_layout.default_spray_width_cm', 4.0)
@@ -195,16 +202,16 @@ class SprayerNode(Node):
         self.declare_parameter('nozzle_layout.activation_zone_target_width_px', -1.0)
         self.declare_parameter('nozzle_layout.activation_zone_target_height_px', -1.0)
         # Timing
-        self.declare_parameter('timing.nozzle_actuation_latency', 0.1) 
+        self.declare_parameter('timing.nozzle_actuation_latency', 0.1)
         self.declare_parameter('timing.spray_margin_time', 0.00)
 
-        # Object Management 
-        self.declare_parameter('object_management.keep_lost_objects_on_screen', False) 
-        self.declare_parameter('object_management.activation_zone_object_width_px', -1.0) 
+        # Object Management
+        self.declare_parameter('object_management.keep_lost_objects_on_screen', False)
+        self.declare_parameter('object_management.activation_zone_object_width_px', -1.0)
 
         # Hardware Interface
-        self.declare_parameter('hardware_interface.type', 'serial_relay') 
-        self.declare_parameter('hardware_interface.serial_relay.port', '/dev/ttyNC0') 
+        self.declare_parameter('hardware_interface.type', 'serial_relay')
+        self.declare_parameter('hardware_interface.serial_relay.port', '/dev/ttyNC0')
         self.declare_parameter('hardware_interface.serial_relay.baudrate', 9600)
 
     def _load_parameters(self) -> dict:
@@ -218,7 +225,7 @@ class SprayerNode(Node):
                 for key in keys[:-1]:
                     d = d.setdefault(key, {})
                 d[keys[-1]] = param_obj.value
-        
+
         if not config.get('input_topic'): raise ParameterException("'input_topic' is missing or empty.")
         if config.get('control_loop_frequency', 0.0) <= 0:
             raise ParameterException("'control_loop_frequency' must be positive.")
@@ -242,36 +249,53 @@ class SprayerNode(Node):
 
     def _setup_communication(self):
         input_topic = self.config['input_topic']
-        gps_topic = self.config.get('gps_topic', '/gpsfix') 
-        
+        gps_topic = self.config.get('gps_topic', '/gpsfix')
+        spraying_state_topic = self.config.get('spraying_state_topic', '/sprayingState')
+
+
         vision_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST,
             depth=5, durability=DurabilityPolicy.VOLATILE
         )
         gps_qos = qos_profile_sensor_data
 
+        spraying_state_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1, 
+            durability=DurabilityPolicy.TRANSIENT_LOCAL 
+        )
+
+
         self.tracking_subscription = self.create_subscription(
             TrackingResults, input_topic, self.tracking_results_callback, vision_qos
         )
         self.get_logger().info(f"Subscribed to Vision: '{input_topic}'")
+
         self.gps_subscription = self.create_subscription(
             GPSFix, gps_topic, self._gps_fix_callback, gps_qos
         )
         self.get_logger().info(f"Subscribed to GPS: '{gps_topic}'")
 
+        self.spraying_state_subscription = self.create_subscription(
+            StringMsg, spraying_state_topic, self._spraying_state_callback, spraying_state_qos
+        )
+        self.get_logger().info(f"Subscribed to Spraying State Control: '{spraying_state_topic}'")
+
+
     def _gps_fix_callback(self, msg: GPSFix):
         if self.motion_model:
             self.motion_model.update_from_gps(msg)
         if self.debug_gui:
-            speed = msg.speed if msg.speed == msg.speed else None 
-            track = msg.track if msg.track == msg.track else None 
+            speed = msg.speed if msg.speed == msg.speed else None
+            track = msg.track if msg.track == msg.track else None
             self.debug_gui.update_from_gps(speed, track)
 
     def tracking_results_callback(self, msg: TrackingResults):
         msg_time = Time.from_msg(msg.header.stamp)
         if msg_time.nanoseconds == 0:
             self.get_logger().warn("TrackingResults received with zero timestamp.")
-        
+
         if self._log_messages:
             self.get_logger().info(
                 f"TrackingResults: TS={msg_time.nanoseconds/1e9:.3f}, Objs={len(msg.tracked_objects)}, "
@@ -283,6 +307,40 @@ class SprayerNode(Node):
             )
         if self.object_manager:
             self.object_manager.update_from_tracking(msg.tracked_objects, msg.header)
+
+    def _spraying_state_callback(self, msg: StringMsg):
+        """
+        Handles messages from the spraying_state_control node to change strategy.
+        """
+        state_command = msg.data
+        self.get_logger().info(f"Received spraying state command: '{state_command}'")
+
+        target_strategy_type: Optional[str] = None
+
+        if state_command == "":
+            target_strategy_type = self._default_strategy_type
+            if target_strategy_type is None:
+                self.get_logger().error("Cannot revert to default strategy: Default type unknown.")
+                return
+            self.get_logger().info(f"Command is empty string, reverting to default strategy: '{target_strategy_type}'")
+        elif state_command == "NA":
+            target_strategy_type = "no_spray"
+        elif state_command == "PA":
+            target_strategy_type = "spray_all"
+        elif state_command == "PAS":
+            target_strategy_type = "simple_weed"
+        else:
+            self.get_logger().warn(f"Unknown spraying state command: '{state_command}'. No strategy change.")
+            return
+
+        if target_strategy_type:
+            if self.strategy and self.strategy.__class__.__name__.lower().replace("strategy","") == target_strategy_type.lower().replace("_", ""):
+                self.get_logger().info(f"Requested strategy '{target_strategy_type}' is already active. No change.")
+            else:
+                self.request_strategy_change(target_strategy_type)
+        else:
+            self.get_logger().error(f"Could not determine target strategy for command '{state_command}'.")
+
 
     def _setup_control_loop(self):
         loop_frequency = self.config.get('control_loop_frequency', 1.0)
@@ -305,21 +363,21 @@ class SprayerNode(Node):
         if self.object_manager:
             display_states = self.object_manager.update_predictions_and_get_display_state()
             all_managed_objects_snapshot = self.object_manager.get_all_managed_objects()
-        
+
         # 2. Get current velocity
         current_velocity_mps = (0.0, 0.0)
         if self.motion_model:
             current_velocity_mps = self.motion_model.get_velocity_mps()
             _, vy_mps = current_velocity_mps
-            velocity_cmps_float = vy_mps * 100.0 
+            velocity_cmps_float = vy_mps * 100.0
             current_velocity_cmps = max(0, min(int(round(velocity_cmps_float)), SerialRelayInterface.MAX_VELOCITY_PAYLOAD))
 
         # 3. Map Objects to Nozzles (for visualization assignment, not primary scheduling)
         objects_for_mapping = [obj for obj in all_managed_objects_snapshot if obj.status in [ObjectStatus.TARGETED, ObjectStatus.SPRAYING, ObjectStatus.SCHEDULED]]
-        target_to_nozzle_map: Dict[int, List[int]] = {} 
+        target_to_nozzle_map: Dict[int, List[int]] = {}
         if self.nozzle_mapper and objects_for_mapping:
             target_to_nozzle_map = self.nozzle_mapper.map_objects_to_nozzles(objects_for_mapping)
-        
+
         # 4. Determine current nozzle commands using SprayScheduler
         num_hw_nozzles = self.nozzle_config.num_nozzles if self.nozzle_config else 0
         if self.spray_scheduler:
@@ -330,7 +388,7 @@ class SprayerNode(Node):
         else:
             effective_nozzles = min(num_hw_nozzles, SerialRelayInterface.MAX_SUPPORTED_NOZZLES)
             current_nozzle_command = [False] * effective_nozzles
-        
+
         if 0 < len(current_nozzle_command) < num_hw_nozzles <= SerialRelayInterface.MAX_SUPPORTED_NOZZLES:
              current_nozzle_command.extend([False] * (num_hw_nozzles - len(current_nozzle_command)))
 
@@ -341,14 +399,14 @@ class SprayerNode(Node):
                 display_states=display_states, # display_states is for drawing, might not have latest status post-scheduling
                 scheduled_objects=all_managed_objects_snapshot, # This list has objects with statuses updated by scheduler
                 nozzle_config=self.nozzle_config,
-                target_nozzle_map=target_to_nozzle_map, 
+                target_nozzle_map=target_to_nozzle_map,
                 current_nozzle_command=current_nozzle_command
             )
 
         # 6. Hardware control
         if self.hardware_interface and self.hardware_interface.is_connected():
             self.hardware_interface.set_nozzle_state(current_nozzle_command, current_velocity_cmps)
-        elif any(current_nozzle_command): 
+        elif any(current_nozzle_command):
             log_method = self.get_logger().error if not (self.hardware_interface and self.hardware_interface.is_connected()) else self.get_logger().warning
             log_method("Spray command generated, but hardware not available/connected.", throttle_duration_sec=5)
 
@@ -356,7 +414,7 @@ class SprayerNode(Node):
         loop_end_mono = time.monotonic()
         duration_ms = (loop_end_mono - loop_start_mono) * 1000.0
         target_period_ms = 1000.0 / self.config.get('control_loop_frequency', 1.0)
-        if duration_ms > target_period_ms * 1.10: 
+        if duration_ms > target_period_ms * 1.10:
             self.get_logger().warning(
                 f"Loop duration ({duration_ms:.2f}ms) > target ({target_period_ms:.2f}ms).",
                 throttle_duration_sec=1.0
@@ -379,7 +437,7 @@ class SprayerNode(Node):
             if self.object_manager is None:
                 self.get_logger().error("ObjectManager not available for strategy change.")
                 return
-            
+
             old_strategy_name = self.strategy.__class__.__name__ if self.strategy else "None"
             self.strategy = new_strategy_instance
             self.object_manager.set_strategy(self.strategy)
@@ -404,30 +462,30 @@ def main(args=None):
         node = SprayerNode()
         rclpy.spin(node)
     except KeyboardInterrupt:
-        logger = node.get_logger() if node else logging.getLogger("sprayer_node.main") 
+        logger = node.get_logger() if node else logging.getLogger("sprayer_node.main")
         logger.info('Keyboard interrupt, shutting down.')
     except SystemExit as e:
-        logger = node.get_logger() if node else logging.getLogger("sprayer_node.main") 
+        logger = node.get_logger() if node else logging.getLogger("sprayer_node.main")
         logger.info(f"SystemExit: {e}")
         exit_code = e.code if isinstance(e.code, int) else 1
     except Exception:
-        logger = node.get_logger() if node else logging.getLogger("sprayer_node.main") 
+        logger = node.get_logger() if node else logging.getLogger("sprayer_node.main")
         logger.fatal(f"Unhandled exception in SprayerNode:\n{traceback.format_exc()}")
         exit_code = 1
     finally:
         if node:
             node.on_shutdown()
             if rclpy.ok():
-                if node.context and node.context.ok(): 
-                    try: 
+                if node.context and node.context.ok():
+                    try:
                         node.destroy_node()
-                    except rclpy.exceptions.InvalidHandle: 
+                    except rclpy.exceptions.InvalidHandle:
                         node.get_logger().warn("Node handle invalid during destroy_node (possibly already destroyed).")
-                    except Exception as destroy_e: 
+                    except Exception as destroy_e:
                         node.get_logger().error(f"Error destroying node: {destroy_e}")
                 else:
-                    print("ROS context invalid before destroy_node, skipping node destruction.")
-        if rclpy.ok(): 
+                    print("SprayerNode: ROS context invalid before destroy_node, skipping node destruction.")
+        if rclpy.ok():
             rclpy.shutdown()
     sys.exit(exit_code)
 

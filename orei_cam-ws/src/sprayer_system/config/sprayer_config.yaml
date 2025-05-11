@@ -32,9 +32,11 @@ sprayer_control_node:
         max_nontarget_overspray_ratio: 1.0 # NOT IMPLEMENTED CURRENTLY
         safety_zone_in_cm: 3.0 # 5cm safety zone for crop_class_names
       spray_all:
+        crop_class_names: []
         min_confidence: 0.0
         min_target_coverage_ratio: 1.0 # NOT IMPLEMENTED CURRENTLY
         max_nontarget_overspray_ratio: 1.0 # NOT IMPLEMENTED CURRENTLY
+        safety_zone_in_cm: 0.0 # 5cm safety zone for crop_class_names
 
     # === Nozzle Layout ===
     nozzle_layout:
