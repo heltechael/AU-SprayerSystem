@@ -1,0 +1,5473 @@
+Project Path: sprayer_system
+
+Source Tree:
+
+```
+sprayer_system
+├── launch
+│   └── sprayer_system.launch.py
+├── sprayer_system
+│   ├── sprayer_node.py
+│   ├── planning
+│   │   ├── nozzle_mapper.py
+│   │   ├── spray_scheduler.py
+│   │   ├── nozzle_configuration.py
+│   │   └── __init__.py
+│   ├── motion
+│   │   ├── motion_model.py
+│   │   └── __init__.py
+│   ├── strategy
+│   │   ├── TEMPLATE_FOR_NEW_STRATEGY.py
+│   │   ├── simple_weed_strategy.py
+│   │   ├── no_spray_strategy.py
+│   │   ├── base_strategy.py
+│   │   ├── factory.py
+│   │   ├── spray_all_strategy.py
+│   │   ├── macro_strategy.py
+│   │   └── __init__.py
+│   ├── object_management
+│   │   ├── object_manager.py
+│   │   └── __init__.py
+│   ├── visualization
+│   │   ├── debug_gui.py
+│   │   └── __init__.py
+│   ├── common
+│   │   ├── geometry.py
+│   │   ├── definitions.py
+│   │   └── __init__.py
+│   ├── hardware_interface
+│   │   ├── base_interface.py
+│   │   ├── factory.py
+│   │   ├── serial_relay_driver.py
+│   │   └── __init__.py
+│   └── __init__.py
+├── nozzle_pruner
+│   ├── prune_nozzle_calibration.py
+│   └── nozzle_calibration.yaml
+├── setup.cfg
+├── resource
+│   └── sprayer_system
+├── package.xml
+├── config
+│   ├── sprayer_config.yaml
+│   ├── nozzle_calibration.yaml
+│   ├── pruned_nozzle_calibration_small.yaml
+│   └── pruned_nozzle_calibration.yaml
+└── setup.py
+
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/launch/sprayer_system.launch.py`:
+
+```py
+import os
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch_ros.actions import Node
+
+def generate_launch_description():
+    package_name = 'sprayer_system'
+    node_executable = 'sprayer_node'
+
+    config_file = os.path.join(
+        get_package_share_directory(package_name),
+        'config',
+        'sprayer_config.yaml'
+    )
+
+    if not os.path.exists(config_file):
+        raise FileNotFoundError(f"Configuration file not found: {config_file}")
+
+    sprayer_node = Node(
+        package=package_name,
+        executable=node_executable,
+        name='sprayer_control_node', 
+        output='screen',
+        emulate_tty=True,
+        parameters=[config_file],
+    )
+
+    return LaunchDescription([
+        sprayer_node
+    ])
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/sprayer_node.py`:
+
+```py
+# ENTRY POINT AND MAIN FILE
+
+import rclpy
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy, qos_profile_sensor_data
+from rclpy.time import Time
+from rclpy.exceptions import ParameterException
+
+from vision_interfaces.msg import TrackingResults
+from gps_msgs.msg import GPSFix
+from std_msgs.msg import String as StringMsg 
+
+from .common.definitions import DisplayObjectState, CameraParams, ObjectStatus, ManagedObject
+from .visualization import DebugGui, OPENCV_AVAILABLE
+from .motion import MotionModel
+from .object_management import ObjectManager
+from .strategy import create_spraying_strategy, BaseSprayStrategy
+from .planning import NozzleConfiguration, NozzleMapper, SprayScheduler
+from .hardware_interface import create_hardware_interface, BaseHardwareInterface
+from .hardware_interface.serial_relay_driver import SerialRelayInterface
+
+import traceback
+import threading
+from typing import Dict, Any, List, Optional, Tuple
+import time
+import sys
+
+class SprayerNode(Node):
+    def __init__(self):
+        super().__init__('sprayer_control_node')
+        self.get_logger().info(f"Initializing {self.get_name()}...")
+        self.config: Dict[str, Any] = {}
+        self._log_messages = False
+        self.debug_gui: Optional[DebugGui] = None
+        self.motion_model: Optional[MotionModel] = None
+        self.strategy: Optional[BaseSprayStrategy] = None
+        self.object_manager: Optional[ObjectManager] = None
+        self.nozzle_config: Optional[NozzleConfiguration] = None
+        self.nozzle_mapper: Optional[NozzleMapper] = None
+        self.control_timer: Optional[rclpy.timer.Timer] = None
+        self.tracking_subscription = None
+        self.gps_subscription = None
+        self.spraying_state_subscription = None
+        self.camera_params: Optional[CameraParams] = None
+        self._strategy_update_lock = threading.Lock()
+        self.spray_scheduler: Optional[SprayScheduler] = None
+        self.hardware_interface: Optional[BaseHardwareInterface] = None
+        self._default_strategy_type: Optional[str] = None
+
+
+        try:
+            self._declare_parameters()
+            self.config = self._load_parameters()
+            self._log_messages = self.config.get('log_received_messages', False)
+            self._default_strategy_type = self.config.get('strategy', {}).get('type')
+            if not self._default_strategy_type:
+                self.get_logger().warn("Default strategy type not found in config. Fallback may not work as expected.")
+
+            self._validate_and_create_cam_params(self.config.get('camera_parameters', {}))
+
+            gui_enabled = self.config.get('debug', {}).get('enable_gui', False)
+            if gui_enabled:
+                if not OPENCV_AVAILABLE:
+                    self.get_logger().warn("Debug GUI enabled, but OpenCV missing. GUI disabled.")
+                else:
+                    debug_config = self.config.get('debug', {})
+                    self.debug_gui = DebugGui(
+                        gui_config=debug_config, node_config=self.config,
+                        node_clock=self.get_clock(), node_logger=self.get_logger(),
+                        strategy_change_callback=self.request_strategy_change
+                    )
+            self.get_logger().info('Parameters loaded and validated successfully.')
+        except (ParameterException, ValueError) as e:
+            error_trace = traceback.format_exc()
+            self.get_logger().fatal(f"Parameter/Validation Error: {e}\n{error_trace}")
+            rclpy.try_shutdown()
+            sys.exit(1)
+        except Exception as e:
+            error_trace = traceback.format_exc()
+            self.get_logger().fatal(f"Unexpected Parameter Setup Error: {e}\n{error_trace}")
+            rclpy.try_shutdown()
+            sys.exit(1)
+
+        try:
+            if not self.camera_params:
+                 raise RuntimeError("CameraParams initialization failed, cannot proceed.")
+
+            self.motion_model = MotionModel(
+                config=self.config.get('motion_model', {}), cam_params=self.camera_params,
+                logger=self.get_logger(), clock=self.get_clock()
+            )
+            self.strategy = create_spraying_strategy(
+                strategy_config=self.config.get('strategy', {}),
+                logger=self.get_logger(), clock=self.get_clock()
+            )
+            if self.strategy is None:
+                raise RuntimeError("Failed to create initial spraying strategy.")
+
+            layout_config = self.config.get('nozzle_layout', {})
+            self.nozzle_config = NozzleConfiguration(layout_config, self.camera_params, self.get_logger())
+
+            if self.nozzle_config.num_nozzles == 0:
+                self.get_logger().error("NO NOZZLES CONFIGURED. Spraying functionality will be severely limited or disabled.")
+            elif self.nozzle_config.num_nozzles > SerialRelayInterface.MAX_SUPPORTED_NOZZLES:
+                self.get_logger().error(
+                    f"Configured nozzle count ({self.nozzle_config.num_nozzles}) exceeds hardware "
+                    f"limit ({SerialRelayInterface.MAX_SUPPORTED_NOZZLES}). "
+                    f"Only the first {SerialRelayInterface.MAX_SUPPORTED_NOZZLES} nozzles can be controlled."
+                )
+
+            self.nozzle_mapper = NozzleMapper(self.nozzle_config, self.get_logger())
+            self.object_manager = ObjectManager(
+                config=self.config,
+                motion_model=self.motion_model,
+                cam_params=self.camera_params,
+                initial_strategy=self.strategy,
+                logger=self.get_logger(),
+                clock=self.get_clock()
+            )
+            timing_config = self.config.get('timing', {})
+            self.spray_scheduler = SprayScheduler(
+                timing_config=timing_config, nozzle_config=self.nozzle_config,
+                logger=self.get_logger(), clock=self.get_clock()
+            )
+
+            hw_config = self.config.get('hardware_interface', {})
+            hw_type = hw_config.get('type', 'dummy')
+            self.hardware_interface = create_hardware_interface(hw_type, hw_config, self.get_logger())
+            if self.hardware_interface:
+                if not self.hardware_interface.connect():
+                    self.get_logger().error(f"Failed to connect to hardware '{hw_type}'. No hardware control.")
+            else:
+                self.get_logger().warning(f"HW interface '{hw_type}' not created or dummy. No hardware control.")
+            self.get_logger().info("Core components initialized.")
+        except Exception as e:
+            error_trace = traceback.format_exc()
+            self.get_logger().fatal(f"Component Initialization Error: {e}\n{error_trace}")
+            rclpy.try_shutdown()
+            sys.exit(1)
+
+        self._setup_communication()
+        self._setup_control_loop()
+        if self.debug_gui:
+            self.debug_gui.start()
+        self.get_logger().info(f"{self.get_name()} initialization complete.")
+
+    def _declare_parameters(self):
+        self.declare_parameter('input_topic', '/vision_system/tracked_objects')
+        self.declare_parameter('gps_topic', '/gpsfix')
+        self.declare_parameter('spraying_state_topic', '/sprayingState')
+        self.declare_parameter('control_loop_frequency', 128.0)
+        self.declare_parameter('log_received_messages', False)
+
+        # Camera
+        self.declare_parameter('camera_parameters.image_width_px', 2464)
+        self.declare_parameter('camera_parameters.image_height_px', 2144)
+        self.declare_parameter('camera_parameters.gsd_px_per_meter', 2209.86)
+
+        # Motion
+        self.declare_parameter('motion_model.playback_speed_factor', 1.0)
+        self.declare_parameter('motion_model.gps_staleness_threshold_sec', 1.0)
+
+        # Debugging
+        self.declare_parameter('debug.enable_gui', True)
+        self.declare_parameter('debug.gui_update_rate', 128.0)
+        self.declare_parameter('debug.gui_window_name', "Sprayer Debug")
+        self.declare_parameter('debug.gui_width', 1232)
+        self.declare_parameter('debug.gui_height', 1067)
+        self.declare_parameter('debug.gui_text_color', [255, 255, 255])
+        self.declare_parameter('debug.gui_font_scale', 0.5)
+        self.declare_parameter('debug.gui_font_thickness', 1)
+        self.declare_parameter('debug.gui_object_fill_opacity', 0.4)
+        self.declare_parameter('debug.gui_spray_fill_opacity', 0.6)
+        self.declare_parameter('debug.gui_object_activation_zone_color', [100, 255, 100])
+
+        # Strategy
+        self.declare_parameter('strategy.type', 'simple_weed')
+        self.declare_parameter('strategy.simple_weed.crop_class_names', ['BEAVA', 'ZEAMX', 'SOLTU'])
+        self.declare_parameter('strategy.simple_weed.min_confidence', 0.0)
+        self.declare_parameter('strategy.simple_weed.min_target_coverage_ratio', 1.0)
+        self.declare_parameter('strategy.simple_weed.max_nontarget_overspray_ratio', 1.0)
+        self.declare_parameter('strategy.simple_weed.safety_zone_in_cm', 0.0)
+
+        self.declare_parameter('strategy.spray_all.min_confidence', 0.0)
+        self.declare_parameter('strategy.spray_all.min_target_coverage_ratio', 1.0)
+        self.declare_parameter('strategy.spray_all.max_nontarget_overspray_ratio', 1.0)
+
+        self.declare_parameter('strategy.macro_strategy.confidence_threshold', 0.4)
+        self.declare_parameter('strategy.macro_strategy.size_threshold_m', 0.04)
+        self.declare_parameter('strategy.macro_strategy.min_target_coverage_ratio', 0.9)
+        self.declare_parameter('strategy.macro_strategy.max_nontarget_overspray_ratio', 0.1)
+
+        # Nozzle Layout
+        self.declare_parameter('nozzle_layout.num_nozzles', 25)
+        self.declare_parameter('nozzle_layout.calibration_file', "")
+        self.declare_parameter('nozzle_layout.placeholder', True)
+        self.declare_parameter('nozzle_layout.default_spacing_cm', 4.0)
+        self.declare_parameter('nozzle_layout.default_spray_width_cm', 4.0)
+        self.declare_parameter('nozzle_layout.default_spray_length_cm', 1.0)
+        self.declare_parameter('nozzle_layout.default_boom_y_position_m', 0.35)
+        self.declare_parameter('nozzle_layout.activation_zone_target_width_px', -1.0)
+        self.declare_parameter('nozzle_layout.activation_zone_target_height_px', -1.0)
+        # Timing
+        self.declare_parameter('timing.nozzle_actuation_latency', 0.1)
+        self.declare_parameter('timing.spray_margin_time', 0.00)
+
+        # Object Management
+        self.declare_parameter('object_management.keep_lost_objects_on_screen', False)
+        self.declare_parameter('object_management.activation_zone_object_width_px', -1.0)
+
+        # Hardware Interface
+        self.declare_parameter('hardware_interface.type', 'serial_relay')
+        self.declare_parameter('hardware_interface.serial_relay.port', '/dev/ttyNC0')
+        self.declare_parameter('hardware_interface.serial_relay.baudrate', 9600)
+
+    def _load_parameters(self) -> dict:
+        param_names = self._parameters.keys()
+        config = {}
+        for param_full_name in param_names:
+            param_obj = self.get_parameter(param_full_name)
+            if param_obj.value is not None:
+                keys = param_full_name.split('.')
+                d = config
+                for key in keys[:-1]:
+                    d = d.setdefault(key, {})
+                d[keys[-1]] = param_obj.value
+
+        if not config.get('input_topic'): raise ParameterException("'input_topic' is missing or empty.")
+        if config.get('control_loop_frequency', 0.0) <= 0:
+            raise ParameterException("'control_loop_frequency' must be positive.")
+        return config
+
+    def _validate_and_create_cam_params(self, cam_config: Dict[str, Any]):
+        width = cam_config.get('image_width_px')
+        height = cam_config.get('image_height_px')
+        gsd = cam_config.get('gsd_px_per_meter')
+        if not (isinstance(width, int) and width > 0):
+            raise ValueError(f"Invalid 'camera_parameters.image_width_px': {width}")
+        if not (isinstance(height, int) and height > 0):
+            raise ValueError(f"Invalid 'camera_parameters.image_height_px': {height}")
+        if not (isinstance(gsd, (int, float)) and gsd > 0):
+            raise ValueError(f"Invalid 'camera_parameters.gsd_px_per_meter': {gsd}")
+        self.camera_params = CameraParams(width_px=width, height_px=height, gsd_px_per_m=float(gsd))
+        self.get_logger().info(
+            f"CameraParams created: {width}x{height}, GSD={gsd:.2f} px/m "
+            f"({self.camera_params.m_per_px * 1000:.2f} mm/px)"
+        )
+
+    def _setup_communication(self):
+        input_topic = self.config['input_topic']
+        gps_topic = self.config.get('gps_topic', '/gpsfix')
+        spraying_state_topic = self.config.get('spraying_state_topic', '/sprayingState')
+
+
+        vision_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST,
+            depth=5, durability=DurabilityPolicy.VOLATILE
+        )
+        gps_qos = qos_profile_sensor_data
+
+        spraying_state_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1, 
+            durability=DurabilityPolicy.TRANSIENT_LOCAL 
+        )
+
+
+        self.tracking_subscription = self.create_subscription(
+            TrackingResults, input_topic, self.tracking_results_callback, vision_qos
+        )
+        self.get_logger().info(f"Subscribed to Vision: '{input_topic}'")
+
+        self.gps_subscription = self.create_subscription(
+            GPSFix, gps_topic, self._gps_fix_callback, gps_qos
+        )
+        self.get_logger().info(f"Subscribed to GPS: '{gps_topic}'")
+
+        self.spraying_state_subscription = self.create_subscription(
+            StringMsg, spraying_state_topic, self._spraying_state_callback, spraying_state_qos
+        )
+        self.get_logger().info(f"Subscribed to Spraying State Control: '{spraying_state_topic}'")
+
+
+    def _gps_fix_callback(self, msg: GPSFix):
+        if self.motion_model:
+            self.motion_model.update_from_gps(msg)
+        if self.debug_gui:
+            speed = msg.speed if msg.speed == msg.speed else None
+            track = msg.track if msg.track == msg.track else None
+            self.debug_gui.update_from_gps(speed, track)
+
+    def tracking_results_callback(self, msg: TrackingResults):
+        msg_time = Time.from_msg(msg.header.stamp)
+        if msg_time.nanoseconds == 0:
+            self.get_logger().warn("TrackingResults received with zero timestamp.")
+
+        if self._log_messages:
+            self.get_logger().info(
+                f"TrackingResults: TS={msg_time.nanoseconds/1e9:.3f}, Objs={len(msg.tracked_objects)}, "
+                f"MotionPx=(dx={msg.estimated_motion_dx:.1f}, dy={msg.estimated_motion_dy:.1f})"
+            )
+        if self.motion_model:
+            self.motion_model.update_from_tracking(
+                msg.estimated_motion_dx, msg.estimated_motion_dy, msg_time
+            )
+        if self.object_manager:
+            self.object_manager.update_from_tracking(msg.tracked_objects, msg.header)
+
+    def _spraying_state_callback(self, msg: StringMsg):
+        """
+        Handles messages from the spraying_state_control node to change strategy.
+        """
+        state_command = msg.data
+        self.get_logger().info(f"Received spraying state command: '{state_command}'")
+
+        target_strategy_type: Optional[str] = None
+
+        if state_command == "":
+            target_strategy_type = self._default_strategy_type
+            if target_strategy_type is None:
+                self.get_logger().error("Cannot revert to default strategy: Default type unknown.")
+                return
+            self.get_logger().info(f"Command is empty string, reverting to default strategy: '{target_strategy_type}'")
+        elif state_command == "NA":
+            target_strategy_type = "no_spray"
+        elif state_command == "PA":
+            target_strategy_type = "spray_all"
+        elif state_command == "PAS":
+            target_strategy_type = "simple_weed"
+        else:
+            self.get_logger().warn(f"Unknown spraying state command: '{state_command}'. No strategy change.")
+            return
+
+        if target_strategy_type:
+            if self.strategy and self.strategy.__class__.__name__.lower().replace("strategy","") == target_strategy_type.lower().replace("_", ""):
+                self.get_logger().info(f"Requested strategy '{target_strategy_type}' is already active. No change.")
+            else:
+                self.request_strategy_change(target_strategy_type)
+        else:
+            self.get_logger().error(f"Could not determine target strategy for command '{state_command}'.")
+
+
+    def _setup_control_loop(self):
+        loop_frequency = self.config.get('control_loop_frequency', 1.0)
+        if loop_frequency <= 0:
+            self.get_logger().error(f"Invalid control_loop_frequency ({loop_frequency}). Disabling loop.")
+            return
+        timer_period = 1.0 / loop_frequency
+        self.control_timer = self.create_timer(timer_period, self._timer_callback)
+        self.get_logger().info(f"Control loop started: {loop_frequency:.1f} Hz (Period: {timer_period*1000:.2f} ms)")
+
+    def _timer_callback(self):
+        loop_start_mono = time.monotonic()
+
+        display_states: List[DisplayObjectState] = []
+        all_managed_objects_snapshot: List[ManagedObject] = []
+        current_nozzle_command: List[bool] = []
+        current_velocity_cmps: int = 0
+
+        # 1. Update object predictions, their bounding boxes (with safety), and get display state
+        if self.object_manager:
+            display_states = self.object_manager.update_predictions_and_get_display_state()
+            all_managed_objects_snapshot = self.object_manager.get_all_managed_objects()
+
+        # 2. Get current velocity
+        current_velocity_mps = (0.0, 0.0)
+        if self.motion_model:
+            current_velocity_mps = self.motion_model.get_velocity_mps()
+            _, vy_mps = current_velocity_mps
+            velocity_cmps_float = vy_mps * 100.0
+            current_velocity_cmps = max(0, min(int(round(velocity_cmps_float)), SerialRelayInterface.MAX_VELOCITY_PAYLOAD))
+
+        # 3. Map Objects to Nozzles (for visualization assignment, not primary scheduling)
+        objects_for_mapping = [obj for obj in all_managed_objects_snapshot if obj.status in [ObjectStatus.TARGETED, ObjectStatus.SPRAYING, ObjectStatus.SCHEDULED]]
+        target_to_nozzle_map: Dict[int, List[int]] = {}
+        if self.nozzle_mapper and objects_for_mapping:
+            target_to_nozzle_map = self.nozzle_mapper.map_objects_to_nozzles(objects_for_mapping)
+
+        # 4. Determine current nozzle commands using SprayScheduler
+        num_hw_nozzles = self.nozzle_config.num_nozzles if self.nozzle_config else 0
+        if self.spray_scheduler:
+            current_nozzle_command = self.spray_scheduler.get_current_nozzle_state(
+                all_managed_objects_snapshot, # Pass all objects
+                current_velocity_mps
+            )
+        else:
+            effective_nozzles = min(num_hw_nozzles, SerialRelayInterface.MAX_SUPPORTED_NOZZLES)
+            current_nozzle_command = [False] * effective_nozzles
+
+        if 0 < len(current_nozzle_command) < num_hw_nozzles <= SerialRelayInterface.MAX_SUPPORTED_NOZZLES:
+             current_nozzle_command.extend([False] * (num_hw_nozzles - len(current_nozzle_command)))
+
+        # 5. Update debug GUI
+        if self.debug_gui:
+            # Pass all_managed_objects_snapshot to GUI so it can display statuses updated by scheduler
+            self.debug_gui.update_display_data(
+                display_states=display_states, # display_states is for drawing, might not have latest status post-scheduling
+                scheduled_objects=all_managed_objects_snapshot, # This list has objects with statuses updated by scheduler
+                nozzle_config=self.nozzle_config,
+                target_nozzle_map=target_to_nozzle_map,
+                current_nozzle_command=current_nozzle_command
+            )
+
+        # 6. Hardware control
+        if self.hardware_interface and self.hardware_interface.is_connected():
+            self.hardware_interface.set_nozzle_state(current_nozzle_command, current_velocity_cmps)
+        elif any(current_nozzle_command):
+            log_method = self.get_logger().error if not (self.hardware_interface and self.hardware_interface.is_connected()) else self.get_logger().warning
+            log_method("Spray command generated, but hardware not available/connected.", throttle_duration_sec=5)
+
+        # 7. Loop timining check
+        loop_end_mono = time.monotonic()
+        duration_ms = (loop_end_mono - loop_start_mono) * 1000.0
+        target_period_ms = 1000.0 / self.config.get('control_loop_frequency', 1.0)
+        if duration_ms > target_period_ms * 1.10:
+            self.get_logger().warning(
+                f"Loop duration ({duration_ms:.2f}ms) > target ({target_period_ms:.2f}ms).",
+                throttle_duration_sec=1.0
+            )
+
+    def request_strategy_change(self, new_strategy_type: str):
+        self.get_logger().info(f"Request to switch strategy to: '{new_strategy_type}'")
+        current_full_strategy_config = self.config.get('strategy', {})
+        new_strategy_instance = create_spraying_strategy(
+            strategy_config=current_full_strategy_config,
+            logger=self.get_logger(), clock=self.get_clock(),
+            strategy_type_override=new_strategy_type
+        )
+
+        if new_strategy_instance is None:
+            self.get_logger().error(f"Failed to create strategy '{new_strategy_type}'. No change.")
+            return
+
+        with self._strategy_update_lock:
+            if self.object_manager is None:
+                self.get_logger().error("ObjectManager not available for strategy change.")
+                return
+
+            old_strategy_name = self.strategy.__class__.__name__ if self.strategy else "None"
+            self.strategy = new_strategy_instance
+            self.object_manager.set_strategy(self.strategy)
+
+            if self.debug_gui:
+                self.debug_gui.update_active_strategy_name(new_strategy_type)
+            self.get_logger().info(f"Switched strategy from {old_strategy_name} to {self.strategy.__class__.__name__}")
+
+    def on_shutdown(self):
+        self.get_logger().info(f"Shutting down {self.get_name()}...")
+        if self.debug_gui: self.debug_gui.stop()
+        if self.control_timer is not None and not self.control_timer.canceled:
+            self.control_timer.cancel()
+        if self.hardware_interface: self.hardware_interface.disconnect()
+        self.get_logger().info(f"{self.get_name()} shutdown complete.")
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = None
+    exit_code = 0
+    try:
+        node = SprayerNode()
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        logger = node.get_logger() if node else logging.getLogger("sprayer_node.main")
+        logger.info('Keyboard interrupt, shutting down.')
+    except SystemExit as e:
+        logger = node.get_logger() if node else logging.getLogger("sprayer_node.main")
+        logger.info(f"SystemExit: {e}")
+        exit_code = e.code if isinstance(e.code, int) else 1
+    except Exception:
+        logger = node.get_logger() if node else logging.getLogger("sprayer_node.main")
+        logger.fatal(f"Unhandled exception in SprayerNode:\n{traceback.format_exc()}")
+        exit_code = 1
+    finally:
+        if node:
+            node.on_shutdown()
+            if rclpy.ok():
+                if node.context and node.context.ok():
+                    try:
+                        node.destroy_node()
+                    except rclpy.exceptions.InvalidHandle:
+                        node.get_logger().warn("Node handle invalid during destroy_node (possibly already destroyed).")
+                    except Exception as destroy_e:
+                        node.get_logger().error(f"Error destroying node: {destroy_e}")
+                else:
+                    print("SprayerNode: ROS context invalid before destroy_node, skipping node destruction.")
+        if rclpy.ok():
+            rclpy.shutdown()
+    sys.exit(exit_code)
+
+if __name__ == '__main__':
+    main()
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/planning/nozzle_mapper.py`:
+
+```py
+import logging
+from typing import List, Dict, Tuple, Optional
+from ..common.definitions import ManagedObject, Nozzle
+from .nozzle_configuration import NozzleConfiguration
+
+class NozzleMapper:
+    """
+    Maps target objects to the nozzles whose spray patterns cover them laterally (X-axis)
+    Uses a fast 1D interval overlap check based on precomputed absolute bounding boxes
+    """
+    def __init__(self, nozzle_config: NozzleConfiguration, logger: logging.Logger):
+        self._nozzle_config = nozzle_config
+        self._logger = logger
+        self._all_nozzles = self._nozzle_config.get_all_nozzles() 
+        self._nozzle_abs_x_intervals: List[Tuple[float, float]] = []
+
+        self._precompute_nozzle_intervals()
+
+        if not self._all_nozzles:
+            self._logger.error("NozzleMapper initialized with zero nozzles!")
+        elif len(self._nozzle_abs_x_intervals) != len(self._all_nozzles):
+             self._logger.error("NozzleMapper init failed: Mismatch between nozzle count and precomputed absolute intervals!")
+             self._nozzle_abs_x_intervals = []
+        else:
+             self._logger.info(f"NozzleMapper initialized with {len(self._all_nozzles)} nozzles and precomputed absolute X intervals.")
+
+    def _precompute_nozzle_intervals(self):
+        """Calculates the absolute ground X-interval for each nozzle's spray pattern"""
+        self._logger.info("Precomputing nozzle absolute X-intervals...")
+        self._nozzle_abs_x_intervals = []
+
+        for nozzle in self._all_nozzles:
+            abs_nozzle_x, _ = nozzle.position_m
+            rel_bbox = nozzle.bounding_box_relative_m
+
+            if rel_bbox:
+                rel_min_x, _, rel_max_x, _ = rel_bbox
+                abs_interval_min_x = abs_nozzle_x + rel_min_x
+                abs_interval_max_x = abs_nozzle_x + rel_max_x
+                self._nozzle_abs_x_intervals.append((abs_interval_min_x, abs_interval_max_x))
+                # self._logger.debug(
+                #    f"  Nozzle {nozzle.index}: PosX={abs_nozzle_x:.3f}, RelBBoxX=({rel_min_x:.3f}, {rel_max_x:.3f}) "
+                #    f"-> Abs Interval=({abs_interval_min_x:.3f}, {abs_interval_max_x:.3f})"
+                #)
+            else:
+                self._logger.warning(f"Nozzle {nozzle.index} has no relative bounding box. Using degenerate absolute interval at {abs_nozzle_x:.3f}m.")
+                self._nozzle_abs_x_intervals.append((abs_nozzle_x, abs_nozzle_x))
+
+        if len(self._nozzle_abs_x_intervals) != len(self._all_nozzles):
+             self._logger.error(f"Precomputation mismatch: Expected {len(self._all_nozzles)} intervals, got {len(self._nozzle_abs_x_intervals)}.")
+
+
+    def map_objects_to_nozzles(self, objects: List[ManagedObject]) -> Dict[int, List[int]]:
+        """
+        Maps objects to nozzles based on lateral (X-axis) overlap between object's predicted bounding box and nozzle's absolute spray bounding box
+        """
+        mapping: Dict[int, List[int]] = {}
+        num_nozzles = len(self._nozzle_abs_x_intervals)
+
+        if num_nozzles == 0:
+            # self._logger.debug("No nozzle intervals precomputed, cannot perform mapping.")
+            return mapping 
+
+        num_input_objects = len(objects)
+        num_mapped = 0
+
+        for obj in objects:
+            # Ensure the object's absolute bounding box is calculated
+            # ObjectManager should ideally call this after prediction update
+            if obj.bounding_box_m is None:
+                obj.update_bounding_box_m()
+
+            if obj.bounding_box_m is None:
+                # self._logger.debug(f"Object {obj.track_id} has no absolute bounding box. Skipping mapping.")
+                continue
+
+            try:
+                obj_min_x, _, obj_max_x, _ = obj.bounding_box_m
+
+                # basic sanity check for object bbox validity
+                if obj_min_x >= obj_max_x:
+                    # self._logger.debug(f"Object {obj.track_id} has invalid X bounds ({obj_min_x:.3f}, {obj_max_x:.3f}). Skipping mapping.")
+                    continue
+
+                covering_nozzles: List[int] = []
+
+                for nozzle_index in range(num_nozzles):
+                    # Use the precomputed ABSOLUTE nozzle interval
+                    nozzle_abs_min_x, nozzle_abs_max_x = self._nozzle_abs_x_intervals[nozzle_index]
+
+                    # Fast 1D interval overlap check
+                    # Checks if the object interval [obj_min_x, obj_max_x] overlaps with the nozzle interval [nozzle_abs_min_x, nozzle_abs_max_x]
+                    overlap = (obj_min_x < nozzle_abs_max_x) and (obj_max_x > nozzle_abs_min_x)
+                    # --------------------------------------
+
+                    if overlap:
+                        covering_nozzles.append(nozzle_index)
+                    # If there's no overlap AND this nozzle starts AFTER the object ends, then no nozzles further right can overlap either (assuming nozzles ordered L->R)
+                    elif nozzle_abs_min_x >= obj_max_x:
+                        break
+                    # ----------------------------
+
+                if covering_nozzles:
+                    mapping[obj.track_id] = covering_nozzles
+                    num_mapped += 1
+                    # self._logger.debug(f"Mapped Target {obj.track_id} (X: {obj_min_x:.2f}-{obj_max_x:.2f}) to Nozzles: {covering_nozzles}")
+
+            except IndexError:
+                 self._logger.error(f"IndexError during mapping for Obj {obj.track_id}. Nozzle intervals/indices mismatch?")
+                 break
+            except Exception as e:
+                 self._logger.error(f"Unexpected error mapping object {obj.track_id}: {e}")
+
+        # self._logger.info(f"Mapped {num_mapped}/{num_input_objects} objects to nozzles.")
+        return mapping
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/planning/spray_scheduler.py`:
+
+```py
+import logging
+import math 
+from typing import List, Dict, Any, Tuple, Optional
+
+from rclpy.time import Time, Duration 
+from rclpy.clock import Clock 
+
+from ..common.definitions import ManagedObject, ObjectStatus, Nozzle
+from .nozzle_configuration import NozzleConfiguration
+
+SERIAL_SEND_DELAY_SEC = 0.001 
+RELAY_RESPONSE_DELAY_SEC = 0.001 
+NOZZLE_ACTUATION_ON_DELAY_SEC = 0.005 
+
+class SprayScheduler:
+    """
+    Determines the current nozzle activation state.
+    1. Activates nozzles based on TARGETED objects' future activation_bounding_box overlap.
+    2. Deactivates nozzles if they would spray into a protected object's future safety_bounding_box.
+    Considers latency and spray margins.
+    """
+    def __init__(self,
+                 timing_config: Dict[str, Any],
+                 nozzle_config: NozzleConfiguration,
+                 logger: logging.Logger,
+                 clock: Clock): 
+        self._config = timing_config
+        self._nozzle_config = nozzle_config
+        self._logger = logger
+        
+        try:
+            self._nozzle_actuation_latency_sec = float(self._config.get('nozzle_actuation_latency', 0.050))
+            self._spray_margin_sec = float(self._config.get('spray_margin_time', 0.020))
+
+            self._min_physical_system_latency_sec = (
+                SERIAL_SEND_DELAY_SEC +
+                RELAY_RESPONSE_DELAY_SEC +
+                NOZZLE_ACTUATION_ON_DELAY_SEC
+            )
+            
+            self._effective_latency_sec = self._nozzle_actuation_latency_sec
+            if self._nozzle_actuation_latency_sec < self._min_physical_system_latency_sec:
+                 self._logger.warning(
+                     f"Configured 'nozzle_actuation_latency' ({self._nozzle_actuation_latency_sec:.3f}s) "
+                     f"is less than estimated minimum physical system delays ({self._min_physical_system_latency_sec:.3f}s). "
+                     "Timing might be optimistic."
+                 )
+            
+            if self._spray_margin_sec < 0:
+                self._logger.warning(f"spray_margin_time ({self._spray_margin_sec:.3f}s) is negative. Clamping to 0.0s.")
+                self._spray_margin_sec = 0.0
+
+            self._logger.info("SprayScheduler Initialized:")
+            self._logger.info(f"  Effective Actuation Latency for Prediction: {self._effective_latency_sec:.3f}s")
+            self._logger.info(f"  Spray Margin (temporal padding for targets): {self._spray_margin_sec:.3f}s")
+
+        except (ValueError, TypeError) as e:
+            self._logger.error(f"Invalid timing configuration for SprayScheduler: {e}")
+            raise ValueError(f"Invalid timing configuration for SprayScheduler: {e}") from e
+
+        if self._nozzle_config.num_nozzles == 0:
+            self._logger.warning("SprayScheduler initialized with zero nozzles from NozzleConfiguration.")
+        
+        self._all_nozzles_cache: List[Nozzle] = self._nozzle_config.get_all_nozzles()
+
+
+    def get_current_nozzle_state(self,
+                                 all_managed_objects: List[ManagedObject],
+                                 current_velocity_mps: Tuple[float, float]
+                                 ) -> List[bool]:
+        num_hw_nozzles = self._nozzle_config.num_nozzles
+        if num_hw_nozzles == 0 or not self._all_nozzles_cache:
+            # If no nozzles, ensure any objects marked SPRAYING are transitioned
+            for obj in all_managed_objects:
+                if obj.status == ObjectStatus.SPRAYING:
+                    obj.status = ObjectStatus.SPRAYED
+            return []
+
+        vx_mps, vy_mps = current_velocity_mps
+        nozzle_states: List[bool] = [False] * num_hw_nozzles
+        # Tracks which object IDs are responsible for activating each nozzle (before safety override)
+        object_initially_activating_nozzle: Dict[int, List[int]] = {i: [] for i in range(num_hw_nozzles)}
+
+        # Step 1: Determine initial nozzle activations based on TARGETED/SPRAYING objects
+        for obj in all_managed_objects:
+            if obj.status not in [ObjectStatus.TARGETED, ObjectStatus.SPRAYING]:
+                continue
+
+            source_bbox_m = obj.activation_bounding_box_m
+            if not source_bbox_m: continue
+            
+            current_act_min_x, current_act_min_y, current_act_max_x, current_act_max_y = source_bbox_m
+            act_width_m = current_act_max_x - current_act_min_x
+            act_length_m = current_act_max_y - current_act_min_y
+            if act_width_m <= 0 or act_length_m <= 0: continue
+            
+            future_obj_center_x_m = obj.predicted_position_robot_m[0] + vx_mps * self._effective_latency_sec
+            future_obj_center_y_m = obj.predicted_position_robot_m[1] + vy_mps * self._effective_latency_sec
+            
+            half_act_w = act_width_m / 2.0
+            half_act_l = act_length_m / 2.0
+            y_margin_m_spray = abs(vy_mps * self._spray_margin_sec)
+
+            obj_future_min_x = future_obj_center_x_m - half_act_w
+            obj_future_max_x = future_obj_center_x_m + half_act_w
+            obj_future_min_y = future_obj_center_y_m - half_act_l - y_margin_m_spray
+            obj_future_max_y = future_obj_center_y_m + half_act_l + y_margin_m_spray
+            
+            for nozzle in self._all_nozzles_cache:
+                if not nozzle.bounding_box_relative_m: continue
+
+                nz_abs_pos_x, nz_abs_pos_y = nozzle.position_m
+                nz_rel_bb_min_x, nz_rel_bb_min_y, nz_rel_bb_max_x, nz_rel_bb_max_y = nozzle.bounding_box_relative_m
+                
+                nz_abs_bb_min_x = nz_abs_pos_x + nz_rel_bb_min_x
+                nz_abs_bb_min_y = nz_abs_pos_y + nz_rel_bb_min_y
+                nz_abs_bb_max_x = nz_abs_pos_x + nz_rel_bb_max_x
+                nz_abs_bb_max_y = nz_abs_pos_y + nz_rel_bb_max_y
+
+                x_overlap = (obj_future_min_x < nz_abs_bb_max_x) and \
+                            (obj_future_max_x > nz_abs_bb_min_x)
+                y_overlap = (obj_future_min_y < nz_abs_bb_max_y) and \
+                            (obj_future_max_y > nz_abs_bb_min_y)
+
+                if x_overlap and y_overlap:
+                    nozzle_idx = nozzle.index
+                    if 0 <= nozzle_idx < num_hw_nozzles:
+                        nozzle_states[nozzle_idx] = True
+                        if obj.track_id not in object_initially_activating_nozzle[nozzle_idx]:
+                             object_initially_activating_nozzle[nozzle_idx].append(obj.track_id)
+        
+        # Step 2: Apply safety overrides from protected objects
+        for obj in all_managed_objects:
+            if obj.current_safety_margin_m > 0.0001 and obj.safety_bounding_box_m:    
+                s_min_x, s_min_y, s_max_x, s_max_y = obj.safety_bounding_box_m
+                s_center_x = (s_min_x + s_max_x) / 2.0
+                s_center_y = (s_min_y + s_max_y) / 2.0
+                s_width = s_max_x - s_min_x
+                s_length = s_max_y - s_min_y
+
+                if s_width <=0 or s_length <=0: continue
+
+                future_s_center_x = s_center_x + vx_mps * self._effective_latency_sec
+                future_s_center_y = s_center_y + vy_mps * self._effective_latency_sec
+
+                future_keep_out_min_x = future_s_center_x - s_width / 2.0
+                future_keep_out_max_x = future_s_center_x + s_width / 2.0
+                future_keep_out_min_y = future_s_center_y - s_length / 2.0
+                future_keep_out_max_y = future_s_center_y + s_length / 2.0
+
+                for nozzle in self._all_nozzles_cache:
+                    nozzle_idx = nozzle.index
+                    if not nozzle_states[nozzle_idx]: continue # Nozzle already off, no need to check
+
+                    if not nozzle.bounding_box_relative_m: continue
+                    nz_abs_pos_x, nz_abs_pos_y = nozzle.position_m
+                    nz_rel_bb_min_x, nz_rel_bb_min_y, nz_rel_bb_max_x, nz_rel_bb_max_y = nozzle.bounding_box_relative_m
+                    
+                    nz_abs_bb_min_x = nz_abs_pos_x + nz_rel_bb_min_x
+                    nz_abs_bb_min_y = nz_abs_pos_y + nz_rel_bb_min_y
+                    nz_abs_bb_max_x = nz_abs_pos_x + nz_rel_bb_max_x
+                    nz_abs_bb_max_y = nz_abs_pos_y + nz_rel_bb_max_y
+                    
+                    x_overlap_safety = (future_keep_out_min_x < nz_abs_bb_max_x) and \
+                                       (future_keep_out_max_x > nz_abs_bb_min_x)
+                    y_overlap_safety = (future_keep_out_min_y < nz_abs_bb_max_y) and \
+                                       (future_keep_out_max_y > nz_abs_bb_min_y)
+
+                    if x_overlap_safety and y_overlap_safety:
+                        nozzle_states[nozzle_idx] = False # Force OFF due to safety
+
+        # Step 3: Update object statuses (SPRAYING, SPRAYED) and assigned nozzles
+        for obj in all_managed_objects:
+            is_obj_causing_any_active_spray_this_tick = False
+            current_tick_assigned_nozzles_for_obj: List[int] = []
+
+            for nozzle_idx in range(num_hw_nozzles):
+                # Check if this nozzle is ON AND this object was one of the initial activators for it
+                if nozzle_states[nozzle_idx] and \
+                   obj.track_id in object_initially_activating_nozzle[nozzle_idx]:
+                    is_obj_causing_any_active_spray_this_tick = True
+                    current_tick_assigned_nozzles_for_obj.append(nozzle_idx)
+            
+            obj.assigned_nozzle_indices = sorted(list(set(current_tick_assigned_nozzles_for_obj)))
+
+            if is_obj_causing_any_active_spray_this_tick:
+                if obj.status != ObjectStatus.SPRAYING:
+                    obj.status = ObjectStatus.SPRAYING
+                    obj.spray_start_time = None 
+                    obj.spray_end_time = None
+            else: 
+                if obj.status == ObjectStatus.SPRAYING:
+                    obj.status = ObjectStatus.SPRAYED 
+                    obj.spray_start_time = None 
+                    obj.spray_end_time = None
+        
+        return nozzle_states
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/planning/nozzle_configuration.py`:
+
+```py
+# /mnt/c/Users/Mic45/Documents/AU/jetson_simulation/orei-cam_ws/src/sprayer_system/sprayer_system/planning/nozzle_configuration.py
+
+import logging
+import os
+import yaml
+from typing import List, Dict, Any, Tuple, Optional
+import numpy as np # For min/max calculations on pattern pixels
+
+from ..common.definitions import Nozzle, CameraParams
+from ..common import geometry
+
+class NozzleConfiguration:
+    """
+    - Loads, validates, and manages the nozzle setup for the spray boom
+    - Can load from a calibration YAML file or generate a default layout
+    - Handles scaling of calibration pixel coordinates if calibration image dimensions differ from the node's configured dimensions
+    - Crucially, it now calculates an 'activation_y_m' for each nozzle, representing the Y-center of its spray pattern on the ground
+    - Allows shrinking of loaded calibration polygons to a target width/height
+    """
+
+    def __init__(self,
+                 layout_config: Dict[str, Any],
+                 node_cam_params: CameraParams,
+                 logger: logging.Logger):
+        self._config = layout_config
+        self._cam_params = node_cam_params
+        self._logger = logger
+        self._nozzles: List[Nozzle] = []
+
+        self._num_nozzles_config = self._config.get('num_nozzles', 0)
+        if not isinstance(self._num_nozzles_config, int) or self._num_nozzles_config <= 0:
+            raise ValueError("NozzleConfiguration: 'num_nozzles' must be a positive integer in config.")
+
+        self._activation_zone_target_width_px = float(self._config.get('activation_zone_target_width_px', -1.0))
+        self._activation_zone_target_height_px = float(self._config.get('activation_zone_target_height_px', -1.0))
+        
+        if self._activation_zone_target_width_px > 0 or self._activation_zone_target_height_px > 0:
+            self._logger.info(
+                f"Nozzle activation zone shrinkage configured: "
+                f"Target Width={self._activation_zone_target_width_px if self._activation_zone_target_width_px > 0 else 'N/A'} px, "
+                f"Target Height={self._activation_zone_target_height_px if self._activation_zone_target_height_px > 0 else 'N/A'} px. "
+                f"(Applies to loaded calibration polygons)"
+            )
+
+        self._load_configuration()
+
+    def _load_configuration(self):
+        calib_file_path = self._config.get('calibration_file', None)
+        use_placeholder_fallback = self._config.get('placeholder', True)
+        loaded_from_calib = False
+
+        if calib_file_path and os.path.exists(calib_file_path):
+            try:
+                self._logger.info(f"Attempting to load nozzle layout from calibration file: {calib_file_path}")
+                self._nozzles = self._load_from_calibration_file(calib_file_path)
+                loaded_from_calib = True
+                self._logger.info(f"Successfully loaded layout for {len(self._nozzles)} nozzles from calibration.")
+            except Exception as e:
+                self._logger.error(f"Failed to load from calibration file '{calib_file_path}': {e}.", exc_info=True)
+                self._nozzles = []
+                loaded_from_calib = False
+        elif calib_file_path:
+            self._logger.warning(f"Calibration file specified but not found: {calib_file_path}")
+
+        if not loaded_from_calib:
+            if use_placeholder_fallback:
+                self._logger.info("Falling back to default nozzle layout generation.")
+                try:
+                    self._nozzles = self._generate_default_layout(self._num_nozzles_config)
+                    self._logger.info(f"Generated default layout for {len(self._nozzles)} nozzles.")
+                except Exception as e:
+                    self._logger.error(f"Failed to generate default layout: {e}", exc_info=True)
+                    self._nozzles = []
+            else:
+                self._logger.error("Calibration file invalid/not found AND placeholder fallback is disabled. No nozzles loaded.")
+                self._nozzles = []
+
+        if len(self._nozzles) != self._num_nozzles_config:
+            self._logger.warning(
+                f"Final nozzle count ({len(self._nozzles)}) does not match configured 'num_nozzles' ({self._num_nozzles_config}). "
+                "This may occur if calibration file has fewer entries or default generation was capped."
+            )
+        elif not self._nozzles:
+            self._logger.error("CRITICAL: No nozzles were successfully loaded or generated.")
+        else:
+            self._logger.info(f"Nozzle configuration complete. Final count: {len(self._nozzles)}")
+            for nzl in self._nozzles:
+                 if nzl.activation_y_m is not None:
+                      self._logger.debug(f"  Nozzle {nzl.index}: Activation Y = {nzl.activation_y_m:.3f} m")
+                 else:
+                      self._logger.warning(f"  Nozzle {nzl.index}: Activation Y is None!")
+
+
+    def _load_from_calibration_file(self, file_path: str) -> List[Nozzle]:
+        try:
+            with open(file_path, 'r') as f:
+                calib_data = yaml.safe_load(f)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Calibration file not found at {file_path}") from None
+        except yaml.YAMLError as e:
+            raise ValueError(f"Error parsing YAML calibration file {file_path}: {e}") from e
+        except OSError as e:
+            raise OSError(f"OS error reading calibration file {file_path}: {e}") from e
+
+        if not isinstance(calib_data, dict):
+            raise ValueError("Calibration file content is not a dictionary.")
+
+        calib_details = calib_data.get('calibration_details', {})
+        calib_nozzles_data = calib_data.get('nozzles', [])
+
+        calib_img_w = calib_details.get('image_width_px')
+        calib_img_h = calib_details.get('image_height_px')
+        if not isinstance(calib_img_w, (int, float)) or calib_img_w <= 0 or \
+           not isinstance(calib_img_h, (int, float)) or calib_img_h <= 0:
+            raise ValueError("Invalid or missing 'image_width_px' or 'image_height_px' in calibration_details.")
+
+        node_w = self._cam_params.width_px
+        node_h = self._cam_params.height_px
+        calib_center_x_img = float(calib_img_w) / 2.0
+        calib_center_y_img = float(calib_img_h) / 2.0
+        node_center_x_img = self._cam_params.center_x_px
+        node_center_y_img = self._cam_params.center_y_px
+
+        scale_x = node_w / calib_img_w if calib_img_w > 0 else 1.0
+        scale_y = node_h / calib_img_h if calib_img_h > 0 else 1.0
+        needs_scaling = (abs(calib_img_w - node_w) > 1e-3 or abs(calib_img_h - node_h) > 1e-3)
+
+        if needs_scaling:
+            self._logger.info(
+                f"Scaling calibration pixels: Calib ({calib_img_w}x{calib_img_h}) -> Node ({node_w}x{node_h}). "
+                f"Scale X={scale_x:.4f}, Y={scale_y:.4f}"
+            )
+        else:
+            self._logger.info("Calibration image dimensions match node configuration. No scaling needed for patterns.")
+
+        try:
+            base_nozzles_for_pos = self._generate_default_layout(self._num_nozzles_config)
+            base_nozzle_map = {n.index: n for n in base_nozzles_for_pos}
+        except Exception as e:
+            self._logger.error(f"Failed to generate base nozzle positions for calibration loading: {e}")
+            raise RuntimeError("Cannot load calibration without base nozzle positions.") from e
+
+        processed_nozzles_dict: Dict[int, Nozzle] = {}
+
+        for nozzle_data_calib in calib_nozzles_data:
+            if not isinstance(nozzle_data_calib, dict): continue
+
+            index = nozzle_data_calib.get('index')
+            pattern_px_calib_raw = nozzle_data_calib.get('spray_pattern_pixels')
+
+            if index is None or not isinstance(index, int) or index < 0 or index >= self._num_nozzles_config:
+                self._logger.warning(f"Skipping nozzle entry with invalid/out-of-range index: {index} from {nozzle_data_calib}")
+                continue
+            if index in processed_nozzles_dict:
+                 self._logger.warning(f"Duplicate index {index} found in calibration. Skipping subsequent entry.")
+                 continue
+            if not isinstance(pattern_px_calib_raw, list) or not pattern_px_calib_raw:
+                self._logger.warning(f"Skipping nozzle index {index} due to missing/empty 'spray_pattern_pixels'.")
+                continue
+            
+            if index in base_nozzle_map:
+                current_nozzle = base_nozzle_map[index]
+            else:
+                self._logger.error(f"Internal error: Index {index} valid but not in base_nozzle_map.")
+                continue
+
+            pattern_px_calib_np = np.array(pattern_px_calib_raw, dtype=np.float32)
+            if pattern_px_calib_np.ndim != 2 or pattern_px_calib_np.shape[1] != 2 or pattern_px_calib_np.shape[0] == 0:
+                self._logger.warning(f"Nozzle {index} has invalid spray_pattern_pixels shape: {pattern_px_calib_np.shape}. Skipping.")
+                continue
+
+            # apply Activation Zone Shrinking (if configured)
+            if self._activation_zone_target_width_px > 0 or self._activation_zone_target_height_px > 0:
+                if pattern_px_calib_np.shape[0] >= 3: # Need at least 3 points for a valid area
+                    try:
+                        orig_min_x_calib = np.min(pattern_px_calib_np[:, 0])
+                        orig_max_x_calib = np.max(pattern_px_calib_np[:, 0])
+                        orig_min_y_calib = np.min(pattern_px_calib_np[:, 1])
+                        orig_max_y_calib = np.max(pattern_px_calib_np[:, 1])
+
+                        orig_width_calib = orig_max_x_calib - orig_min_x_calib
+                        orig_height_calib = orig_max_y_calib - orig_min_y_calib
+                        
+                        center_x_calib = (orig_min_x_calib + orig_max_x_calib) / 2.0
+                        center_y_calib = (orig_min_y_calib + orig_max_y_calib) / 2.0
+
+                        new_poly_min_x_calib = orig_min_x_calib
+                        new_poly_max_x_calib = orig_max_x_calib
+                        new_poly_min_y_calib = orig_min_y_calib
+                        new_poly_max_y_calib = orig_max_y_calib
+                        
+                        width_changed = False
+                        height_changed = False
+
+                        if self._activation_zone_target_width_px > 0 and orig_width_calib > 1e-3:
+                            target_w = self._activation_zone_target_width_px
+                            final_w = min(orig_width_calib, target_w)
+                            if abs(final_w - orig_width_calib) > 1e-3 :
+                                new_poly_min_x_calib = center_x_calib - final_w / 2.0
+                                new_poly_max_x_calib = center_x_calib + final_w / 2.0
+                                width_changed = True
+                        
+                        if self._activation_zone_target_height_px > 0 and orig_height_calib > 1e-3:
+                            target_h = self._activation_zone_target_height_px
+                            final_h = min(orig_height_calib, target_h)
+                            if abs(final_h - orig_height_calib) > 1e-3:
+                                new_poly_min_y_calib = center_y_calib - final_h / 2.0
+                                new_poly_max_y_calib = center_y_calib + final_h / 2.0
+                                height_changed = True
+
+                        if width_changed or height_changed:
+                            pattern_px_calib_np = np.array([
+                                [new_poly_min_x_calib, new_poly_min_y_calib], # Top-left
+                                [new_poly_max_x_calib, new_poly_min_y_calib], # Top-right
+                                [new_poly_max_x_calib, new_poly_max_y_calib], # Bottom-right
+                                [new_poly_min_x_calib, new_poly_max_y_calib]  # Bottom-left
+                            ], dtype=np.float32)
+                            self._logger.info(
+                                f"  Nozzle {index}: Activation zone polygon shrunk. "
+                                f"New calib_px bounds: X=[{new_poly_min_x_calib:.1f}, {new_poly_max_x_calib:.1f}], "
+                                f"Y=[{new_poly_min_y_calib:.1f}, {new_poly_max_y_calib:.1f}]"
+                            )
+                    except Exception as shrink_e:
+                        self._logger.error(f"Error during activation zone shrinking for nozzle {index}: {shrink_e}. Using original polygon.")
+
+            pattern_relative_m: List[Tuple[float, float]] = []
+            valid_pattern_conversion = True
+            for point_px_calib in pattern_px_calib_np: # iterate (maybe shrunk) polygon points
+                try:
+                    calib_x, calib_y = point_px_calib
+                    equiv_node_px_x, equiv_node_px_y = calib_x, calib_y
+                    if needs_scaling:
+                        rel_calib_x = calib_x - calib_center_x_img
+                        rel_calib_y = calib_y - calib_center_y_img
+                        scaled_rel_x = rel_calib_x * scale_x
+                        scaled_rel_y = rel_calib_y * scale_y
+                        equiv_node_px_x = scaled_rel_x + node_center_x_img
+                        equiv_node_px_y = scaled_rel_y + node_center_y_img
+
+                    abs_ground_m = geometry.image_px_to_robot_ground_m(
+                        (equiv_node_px_x, equiv_node_px_y), self._cam_params
+                    )
+                    rel_m_x = abs_ground_m[0] - current_nozzle.position_m[0]
+                    rel_m_y = abs_ground_m[1] - current_nozzle.position_m[1]
+                    pattern_relative_m.append((rel_m_x, rel_m_y))
+                except Exception as conv_e:
+                    self._logger.error(f"Error converting/scaling point {point_px_calib} for nozzle {index}: {conv_e}")
+                    valid_pattern_conversion = False; break
+            
+            if not valid_pattern_conversion:
+                self._logger.warning(f"Failed to convert full pattern for nozzle {index}. It will retain default pattern if any.")
+                processed_nozzles_dict[index] = current_nozzle
+                continue
+
+            current_nozzle.spray_pattern_relative_m = pattern_relative_m
+            current_nozzle.recalculate_bounding_box()
+
+            calib_pat_min_x = np.min(pattern_px_calib_np[:, 0])
+            calib_pat_max_x = np.max(pattern_px_calib_np[:, 0])
+            calib_pat_min_y = np.min(pattern_px_calib_np[:, 1])
+            calib_pat_max_y = np.max(pattern_px_calib_np[:, 1])
+
+            calib_pat_center_x_px = (calib_pat_min_x + calib_pat_max_x) / 2.0
+            calib_pat_center_y_px = (calib_pat_min_y + calib_pat_max_y) / 2.0
+
+            equiv_node_pat_center_x_px, equiv_node_pat_center_y_px = calib_pat_center_x_px, calib_pat_center_y_px
+            if needs_scaling:
+                rel_calib_ctr_x = calib_pat_center_x_px - calib_center_x_img
+                rel_calib_ctr_y = calib_pat_center_y_px - calib_center_y_img
+                scaled_rel_ctr_x = rel_calib_ctr_x * scale_x
+                scaled_rel_ctr_y = rel_calib_ctr_y * scale_y
+                equiv_node_pat_center_x_px = scaled_rel_ctr_x + node_center_x_img
+                equiv_node_pat_center_y_px = scaled_rel_ctr_y + node_center_y_img
+            
+            try:
+                abs_ground_pattern_center_m = geometry.image_px_to_robot_ground_m(
+                    (equiv_node_pat_center_x_px, equiv_node_pat_center_y_px), self._cam_params
+                )
+                current_nozzle.activation_y_m = abs_ground_pattern_center_m[1]
+            except Exception as e:
+                self._logger.error(f"Error converting pattern center to ground for nozzle {index} activation_y_m: {e}. Using default.")
+
+            processed_nozzles_dict[index] = current_nozzle
+            
+        final_nozzles_list: List[Nozzle] = []
+        for i in range(self._num_nozzles_config):
+            if i in processed_nozzles_dict:
+                final_nozzles_list.append(processed_nozzles_dict[i])
+            elif i in base_nozzle_map: 
+                self._logger.warning(f"Nozzle {i} not in calibration file. Using default pattern and activation Y.")
+                final_nozzles_list.append(base_nozzle_map[i])
+
+        final_nozzles_list.sort(key=lambda n: n.index)
+        return final_nozzles_list
+
+
+    def _generate_default_layout(self, num_nozzles: int) -> List[Nozzle]:
+        try:
+            spacing_cm = float(self._config['default_spacing_cm'])
+            spray_width_cm = float(self._config['default_spray_width_cm'])
+            spray_length_cm = float(self._config['default_spray_length_cm'])
+            default_nozzle_center_y_m = float(self._config.get('default_boom_y_position_m', 0.0))
+        except KeyError as e:
+            raise KeyError(f"Missing required default layout parameter: '{e}'") from e
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Invalid numerical value for default layout parameter: {e}") from e
+
+        if spacing_cm <= 0: raise ValueError("default_spacing_cm must be positive")
+        if spray_width_cm <= 0: raise ValueError("default_spray_width_cm must be positive")
+        if spray_length_cm <= 0: raise ValueError("default_spray_length_cm must be positive")
+
+        spacing_m = spacing_cm / 100.0
+        spray_width_m = spray_width_cm / 100.0
+        spray_length_m = spray_length_cm / 100.0
+
+        self._logger.info(f"  Generating Default Layout Params: Spacing={spacing_cm}cm, "
+                          f"Spray W={spray_width_cm}cm, Spray L={spray_length_cm}cm, "
+                          f"Default Nozzle Y Center={default_nozzle_center_y_m:.3f}m")
+
+        nozzles_list: List[Nozzle] = []
+        total_boom_width = (num_nozzles - 1) * spacing_m if num_nozzles > 0 else 0
+        start_x = -total_boom_width / 2.0
+
+        half_width = spray_width_m / 2.0
+        half_length = spray_length_m / 2.0
+        default_pattern_relative_m = [
+            (-half_width, -half_length), ( half_width, -half_length),
+            ( half_width,  half_length), (-half_width,  half_length)
+        ]
+
+        for i in range(num_nozzles):
+            pos_x = start_x + i * spacing_m
+            nozzle = Nozzle(
+                index=i,
+                position_m=(pos_x, default_nozzle_center_y_m), 
+                spray_pattern_relative_m=list(default_pattern_relative_m)
+            )
+            nozzle.activation_y_m = default_nozzle_center_y_m
+            nozzles_list.append(nozzle)
+
+        return nozzles_list
+
+    def get_nozzle(self, index: int) -> Optional[Nozzle]:
+        for nozzle in self._nozzles:
+            if nozzle.index == index:
+                return nozzle
+        self._logger.warning(f"Attempted to get invalid nozzle index: {index}")
+        return None
+
+    def get_all_nozzles(self) -> List[Nozzle]:
+        return list(self._nozzles) 
+
+    @property
+    def num_nozzles(self) -> int:
+        return len(self._nozzles)
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/planning/__init__.py`:
+
+```py
+from .nozzle_configuration import NozzleConfiguration
+from .nozzle_mapper import NozzleMapper
+from .spray_scheduler import SprayScheduler
+
+__all__ = [
+    "NozzleConfiguration",
+    "NozzleMapper",
+    "SprayScheduler",
+]
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/motion/motion_model.py`:
+
+```py
+import logging
+from typing import Optional, Tuple, Dict, Any
+
+from rclpy.time import Time, Duration
+from rclpy.clock import Clock
+from gps_msgs.msg import GPSFix, GPSStatus 
+from ..common.definitions import CameraParams
+
+class MotionModel:
+    """
+    Estimates robot ground velocity (m/s) relative to the robot frame (+Y forward, +X right)
+    Uses valid, non-stale GPS speed for the primary forward component (vy)
+    Uses vision-derived pixel displacement (dx, dy) scaled by GSD for the lateral component (vx)
+    and as a fallback for the forward component (vy) if GPS is invalid or stale
+    Applies playback speed factor directly (for ROS BAG playbacks at lower speeds)
+    """
+    MIN_VALID_GPS_STATUS = GPSStatus.STATUS_FIX 
+
+    def __init__(self,
+                 config: Dict[str, Any],
+                 cam_params: CameraParams,
+                 logger: logging.Logger,
+                 clock: Clock):
+        self._config = config
+        self._cam_params = cam_params
+        self._logger = logger
+        self._clock = clock
+        self._last_gps_time: Optional[Time] = None
+        self._latest_gps_speed_mps: Optional[float] = None 
+        self._last_gps_is_valid: bool = False
+        self._gps_staleness_threshold_sec: float = float(self._config.get('gps_staleness_threshold_sec', 1.0))
+        self._last_vision_update_time: Optional[Time] = None
+        self._raw_vx_mps_vision: float = 0.0
+        self._raw_vy_mps_vision: float = 0.0
+        self._output_vx_mps: float = 0.0
+        self._output_vy_mps: float = 0.0
+        self._vy_source: str = "Startup"
+        self._playback_speed_factor: float = float(self._config.get('playback_speed_factor', 1.0))
+
+        log_suffix = ""
+        if self._playback_speed_factor != 1.0:
+             log_suffix = f" (Playback Speed Factor: {self._playback_speed_factor:.2f})"
+        self._logger.info(f"MotionModel initialized (m/s){log_suffix}")
+        if self._gps_staleness_threshold_sec > 0:
+            self._logger.info(f"  GPS Staleness Check: Enabled (threshold={self._gps_staleness_threshold_sec:.2f}s)")
+        else:
+            self._logger.info("  GPS Staleness Check: Disabled")
+        self._logger.info(f"  Minimum Valid GPS Status: {self.MIN_VALID_GPS_STATUS}")
+
+
+    def update_from_tracking(self,
+                             estimated_dx_px: float,
+                             estimated_dy_px: float,
+                             message_time: Time):
+        """
+        Updates the vision-derived velocity components (vx, vy) in m/s
+        These are used for the lateral component (vx) and as a fallback for vy
+        """
+        if message_time.nanoseconds == 0:
+            self._logger.warn("MotionModel (Vision Update): Received zero timestamp. Cannot calculate velocity.")
+            return
+
+        if self._last_vision_update_time is None:
+            self._logger.debug(f"MotionModel (Vision Update): Storing first vision timestamp: {message_time.nanoseconds / 1e9:.3f}s.")
+            self._last_vision_update_time = message_time
+            return
+
+        dt_duration: Duration = message_time - self._last_vision_update_time
+        dt_sec = dt_duration.nanoseconds / 1e9
+
+        #self._logger.info(f"[MOTION DT DEBUG] Current Msg Time: {message_time.nanoseconds / 1e9:.6f}")
+        if self._last_vision_update_time:
+            #self._logger.info(f"[MOTION DT DEBUG] Last Vision Time: {self._last_vision_update_time.nanoseconds / 1e9:.6f}")
+            dt_duration: Duration = message_time - self._last_vision_update_time
+            dt_sec = dt_duration.nanoseconds / 1e9
+            #self._logger.info(f"[MOTION DT DEBUG] Calculated dt_sec: {dt_sec:.6f} | dx_px: {estimated_dx_px:.2f}, dy_px: {estimated_dy_px:.2f}")
+            if dt_sec > 1e-9:
+                try: 
+                    dx_m = estimated_dx_px * self._cam_params.m_per_px
+                    dy_m = estimated_dy_px * self._cam_params.m_per_px
+                    raw_vx = dx_m / dt_sec
+                    raw_vy = dy_m / dt_sec
+                    #self._logger.info(f"[MOTION DT DEBUG] Raw Vision Vel (m/s): vx={raw_vx:.3f}, vy={raw_vy:.3f}")
+                except Exception as calc_e:
+                    self._logger.error(f"[MOTION DT DEBUG] Error in debug velocity calc: {calc_e}")
+            else:
+                self._logger.warning("[MOTION DT DEBUG] dt_sec too small for velocity calculation.")
+        else:
+            self._logger.info("[MOTION DT DEBUG] First vision message, skipping dt calculation")
+
+        # sanity dt check
+        max_reasonable_dt = 5.0
+        if dt_sec <= 1e-9:
+            # self._logger.warn(f"MotionModel (Vision Update): Non-positive vision dt ({dt_sec:.4f}s). Resetting vision velocity.")
+            self._last_vision_update_time = message_time
+            self._raw_vx_mps_vision = 0.0
+            self._raw_vy_mps_vision = 0.0
+            self._update_output_velocity()
+            return
+        elif dt_sec > max_reasonable_dt:
+             self._logger.warn(f"MotionModel (Vision Update): Unusually large vision dt ({dt_sec:.4f}s > {max_reasonable_dt}s). Resetting vision velocity.")
+             self._raw_vx_mps_vision = 0.0
+             self._raw_vy_mps_vision = 0.0
+             self._last_vision_update_time = message_time 
+             self._update_output_velocity()
+             return
+
+        # convert pixel displacement to meters using GSD 
+        try:
+            dx_m = estimated_dx_px * self._cam_params.m_per_px
+            dy_m = estimated_dy_px * self._cam_params.m_per_px
+        except Exception as e:
+             self._logger.error(f"MotionModel (Vision Update): Error converting pixels to meters: {e}")
+             dx_m = 0.0
+             dy_m = 0.0
+
+        # calculate vision-based velocity (m/s) 
+        try:
+            self._raw_vx_mps_vision = dx_m / dt_sec
+            self._raw_vy_mps_vision = dy_m / dt_sec
+        except ZeroDivisionError:
+             self._logger.warn(f"MotionModel (Vision Update): Zero division error calculating vision velocity (dt={dt_sec:.4f}s).")
+             self._raw_vx_mps_vision = 0.0
+             self._raw_vy_mps_vision = 0.0
+        except Exception as e:
+            self._logger.error(f"MotionModel (Vision Update): Error calculating vision velocity: {e}")
+            self._raw_vx_mps_vision = 0.0
+            self._raw_vy_mps_vision = 0.0
+
+        self._update_output_velocity() # 
+        self._last_vision_update_time = message_time
+
+
+    def update_from_gps(self, gps_msg: GPSFix):
+        """
+        Updates the internal state with the latest GPS speed and timestamp - checking for validity
+        """
+        current_gps_time = Time.from_msg(gps_msg.header.stamp)
+        current_gps_status = gps_msg.status.status
+        current_gps_unix_time = gps_msg.time 
+
+        is_currently_valid = (
+            current_gps_time.nanoseconds > 0 and
+            current_gps_unix_time > 0 and 
+            current_gps_status >= self.MIN_VALID_GPS_STATUS and
+            gps_msg.speed == gps_msg.speed 
+        )
+
+        self._last_gps_time = current_gps_time
+        self._last_gps_is_valid = is_currently_valid 
+
+        if is_currently_valid:
+            if gps_msg.speed >= 0:
+                self._latest_gps_speed_mps = gps_msg.speed
+                # self._logger.debug(f"MotionModel (GPS Update): Valid GPS received. Speed: {self._latest_gps_speed_mps:.2f} m/s")
+            else:
+                # This case might be unlikely if status check passes - fine to keep
+                self._logger.warn(f"MotionModel (GPS Update): Valid GPS status but negative speed ({gps_msg.speed:.2f} m/s). Treating as invalid speed.")
+                self._latest_gps_speed_mps = None 
+                self._last_gps_is_valid = False 
+        else:
+            if self._latest_gps_speed_mps is not None: 
+                 self._logger.warn(f"MotionModel (GPS Update): Received invalid GPS data (Status: {current_gps_status}, Time: {current_gps_unix_time:.2f}, HeaderStamp: {current_gps_time.nanoseconds}). Clearing GPS speed.")
+            self._latest_gps_speed_mps = None
+
+        self._update_output_velocity() 
+
+
+    def _update_output_velocity(self):
+        """
+        Selects appropriate velocity components (GPS-priority for vy if valid and not stale)
+        and applies the playback speed factor directly. Records the source of vy
+        """
+        current_vx = self._raw_vx_mps_vision
+        current_vy = 0.0
+        vy_source = "Unknown" 
+
+        # should gps be used for vy?
+        is_stale = self.is_gps_data_stale()
+        use_gps_for_vy = self._last_gps_is_valid and not is_stale and self._latest_gps_speed_mps is not None
+
+        if use_gps_for_vy:
+            current_vy = self._latest_gps_speed_mps
+            vy_source = "GPS"
+        else:
+            # use vision vy as fallback
+            current_vy = self._raw_vy_mps_vision
+            vy_source = "VisionFallback"
+            log_reason = ""
+            if not self._last_gps_is_valid: log_reason += "Invalid "
+            if is_stale: log_reason += "Stale "
+            if self._latest_gps_speed_mps is None and self._last_gps_is_valid and not is_stale: log_reason += "NoSpeed " # probably rare
+            if not log_reason: log_reason = "UnknownReason" # Fallback reason
+
+            self._logger.warn(f"MotionModel: Using VisionFallback for Vy. Reason: {log_reason.strip()}", throttle_duration_sec=2.0)
+
+        self._output_vx_mps = current_vx * self._playback_speed_factor
+        self._output_vy_mps = current_vy * self._playback_speed_factor
+        self._vy_source = vy_source 
+
+        # THIS WILL MAKE COMPUTATION EXCEED 128 HZ DEADLINES!!! ONLY LOG FOR VELOCITY RELATED DEBUGGING
+        # self._logger.debug(f"MotionModel Updated Output Velocity: Vx={self._output_vx_mps:.2f}, Vy={self._output_vy_mps:.2f} m/s (Vy Source: {self._vy_source})")
+
+    def get_velocity_mps(self) -> Tuple[float, float]:
+        return self._output_vx_mps, self._output_vy_mps
+
+    def get_vy_source(self) -> str:
+        return self._vy_source
+
+    def is_gps_data_stale(self) -> bool:
+        if self._gps_staleness_threshold_sec <= 0:
+            return False 
+
+        if self._last_gps_time is None:
+            return True 
+
+        now = self._clock.now()
+        age_duration = now - self._last_gps_time
+        age_sec = age_duration.nanoseconds / 1e9
+
+        is_stale = age_sec > self._gps_staleness_threshold_sec
+        if is_stale:
+            self._logger.debug(f"GPS data is stale (Age: {age_sec:.2f}s > Threshold: {self._gps_staleness_threshold_sec:.2f}s)")
+        return is_stale
+
+    def get_last_gps_time(self) -> Optional[Time]:
+        return self._last_gps_time
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/motion/__init__.py`:
+
+```py
+from .motion_model import MotionModel
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/strategy/TEMPLATE_FOR_NEW_STRATEGY.py`:
+
+```py
+import logging
+from typing import Dict, Any, Set, List
+from rclpy.clock import Clock
+from .base_strategy import BaseSprayStrategy
+from ..common.definitions import ManagedObject
+
+class TemplateStrategy(BaseSprayStrategy):
+    def __init__(self, strategy_config: Dict[str, Any], logger: logging.Logger, clock: Clock):
+        super().__init__(strategy_config, logger, clock)
+        self._logger.info(f"Initializing {self.__class__.__name__}...")
+        pass
+
+    def decide(self, target: ManagedObject) -> bool:
+        # DEFINE STRATEGY FOR SINGLE OBJECT HERE
+        # see "ManagedObject" in common/definitions.py for available info to define strat
+        pass
+
+    def get_min_target_coverage_ratio(self) -> float:
+        return self._min_coverage
+
+    def get_max_nontarget_overspray_ratio(self) -> float:
+        return self._max_overspray
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/strategy/simple_weed_strategy.py`:
+
+```py
+import logging
+from typing import Dict, Any, Set, List
+from rclpy.clock import Clock
+from .base_strategy import BaseSprayStrategy
+from ..common.definitions import ManagedObject
+
+class SimpleWeedStrategy(BaseSprayStrategy):
+    """
+    Simple weed spraying strategy.
+
+    Targets objects if:
+    1. Confidence >= min_confidence
+    2. Class name is NOT in the configured crop_class_names list.
+    Applies a safety zone around configured crop_class_names.
+    """
+    def __init__(self, strategy_config: Dict[str, Any], logger: logging.Logger, clock: Clock):
+        super().__init__(strategy_config, logger, clock)
+        self._logger.info(f"Initializing {self.__class__.__name__}...")
+
+        try:
+            crop_names_list: List[str] = self._config.get('crop_class_names', [])
+            if not isinstance(crop_names_list, list):
+                raise ValueError("'crop_class_names' must be a list of strings.")
+            self._crop_class_names: Set[str] = set(crop_names_list)
+
+            self._min_confidence: float = float(self._config.get('min_confidence', 0.4))
+            if not (0.0 <= self._min_confidence <= 1.0):
+                raise ValueError("min_confidence must be between 0.0 and 1.0")
+
+            self._safety_zone_cm: float = float(self._config.get('safety_zone_in_cm', 0.0))
+            if self._safety_zone_cm < 0.0:
+                self._logger.warning(f"safety_zone_in_cm ({self._safety_zone_cm}cm) is negative. Clamping to 0.0cm.")
+                self._safety_zone_cm = 0.0
+            self._safety_zone_m: float = self._safety_zone_cm / 100.0
+
+            self._parse_common_constraints() 
+
+        except (ValueError, TypeError) as e:
+            self._logger.error(f"Configuration error for {self.__class__.__name__}: {e}")
+            raise ValueError(f"Configuration error in {self.__class__.__name__}") from e
+
+        if not self._crop_class_names:
+            self._logger.warning("No 'crop_class_names' configured for SimpleWeedStrategy. All non-low-confidence objects might be targeted.")
+        else:
+            self._logger.info(f"  Crop Classes (Protected): {sorted(list(self._crop_class_names))}")
+            self._logger.info(f"  Safety Zone for Protected Classes: {self._safety_zone_cm:.1f} cm ({self._safety_zone_m:.3f} m)")
+        self._logger.info(f"  Min Confidence Threshold: {self._min_confidence:.2f}")
+
+
+    def decide(self, target: ManagedObject) -> bool:
+        if target.confidence < self._min_confidence:
+            return False 
+
+        # Avoid min size in meters
+        obj_width_m, obj_length_m = target.size_m
+        if obj_width_m <= 0.005 and obj_length_m <= 0.005: # 5mm
+            return False
+
+        if target.class_name in self._crop_class_names:
+            return False # Do not spray crops
+
+        return True # Spray if it's not a crop and meets confidence/size
+
+    def get_safety_zone_m(self, target: ManagedObject) -> float:
+        if target.class_name in self._crop_class_names:
+            return self._safety_zone_m
+        return 0.0
+
+    def get_min_target_coverage_ratio(self) -> float:
+        return self._min_coverage
+
+    def get_max_nontarget_overspray_ratio(self) -> float:
+        return self._max_overspray
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/strategy/no_spray_strategy.py`:
+
+```py
+import logging
+from typing import Dict, Any
+from rclpy.clock import Clock
+from .base_strategy import BaseSprayStrategy
+from ..common.definitions import ManagedObject
+
+class NoSprayStrategy(BaseSprayStrategy):
+    """
+    A strategy that does not spray any object
+    """
+    def __init__(self, strategy_config: Dict[str, Any], logger: logging.Logger, clock: Clock):
+        super().__init__(strategy_config, logger, clock)
+        self._logger.info(f"Initializing {self.__class__.__name__}...")
+        self._parse_common_constraints()
+        self._logger.info(f"  {self.__class__.__name__}: All objects will be IGNORED.")
+
+    def decide(self, target: ManagedObject) -> bool:
+        # never spray any object
+        return False
+
+    def get_safety_zone_m(self, target: ManagedObject) -> float:
+        return 0.0
+
+    def get_min_target_coverage_ratio(self) -> float:
+        return self._min_coverage
+
+    def get_max_nontarget_overspray_ratio(self) -> float:
+        return self._max_overspray
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/strategy/base_strategy.py`:
+
+```py
+from abc import ABC, abstractmethod
+from typing import Dict, Any
+import logging
+from rclpy.clock import Clock
+from ..common.definitions import ManagedObject
+
+class BaseSprayStrategy(ABC):
+    """
+    Abstract Base Class defining the interface for spray decision strategies
+    """
+    def __init__(self, strategy_config: Dict[str, Any], logger: logging.Logger, clock: Clock):
+        self._config = strategy_config
+        self._logger = logger
+        self._clock = clock
+        self._min_coverage = 0.9 # default
+        self._max_overspray = 0.5 # default
+
+    @abstractmethod
+    def decide(self, target: ManagedObject) -> bool:
+        """
+        Decides if the given target object should be sprayed
+
+        Args:
+            target: The ManagedObject instance to evaluate
+
+        Returns:
+            True if the object should be targeted for spraying, False otherwise
+        """
+        pass
+
+    @abstractmethod
+    def get_min_target_coverage_ratio(self) -> float:
+        """
+        Returns the minimum required coverage ratio (0.0-1.0) for objects that this strategy decides should be sprayed. Used by planners
+        """
+        pass
+
+    @abstractmethod
+    def get_max_nontarget_overspray_ratio(self) -> float:
+        """
+        Returns the maximum allowable overspray ratio (0.0-1.0) onto objects that this strategy decides should *not* be sprayed. Used by planners
+        """
+        pass
+
+    @abstractmethod
+    def get_safety_zone_m(self, target: ManagedObject) -> float:
+        """
+        Returns the safety zone margin in meters for the given target.
+        A non-zero value indicates the object (and this margin around it) should be protected.
+        """
+        pass
+
+    def _parse_common_constraints(self):
+        """
+        Helper method to parse and validate common constraint parameters from the strategy's configuration dictionary. Concrete strategies should call this
+        """
+        try:
+            self._min_coverage = float(self._config.get('min_target_coverage_ratio', 0.9))
+            self._max_overspray = float(self._config.get('max_nontarget_overspray_ratio', 0.1))
+
+            if not (0.0 <= self._min_coverage <= 1.0):
+                raise ValueError("min_target_coverage_ratio must be between 0.0 and 1.0")
+            if not (0.0 <= self._max_overspray <= 1.0):
+                raise ValueError("max_nontarget_overspray_ratio must be between 0.0 and 1.0")
+
+            self._logger.info(f"  Strategy Constraints Parsed: Min Coverage={self._min_coverage:.2f}, Max Overspray={self._max_overspray:.2f}")
+
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Invalid constraint configuration: {e}") from e
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/strategy/factory.py`:
+
+```py
+from typing import Dict, Any, Optional
+import logging
+import traceback
+from rclpy.clock import Clock
+from .base_strategy import BaseSprayStrategy
+from .simple_weed_strategy import SimpleWeedStrategy
+from .spray_all_strategy import SprayAllStrategy
+from .macro_strategy import MarcoStrategy
+from .no_spray_strategy import NoSprayStrategy
+
+# Import other strategies here, e.g. MarcoStrat{2/3/4}
+
+def create_spraying_strategy(strategy_config: Dict[str, Any], logger: logging.Logger, clock: Clock, strategy_type_override: Optional[str] = None) -> Optional[BaseSprayStrategy]:
+    strategy_type = strategy_type_override if strategy_type_override is not None else strategy_config.get('type')
+
+    logger.info(f"Attempting to create spraying strategy of type: '{strategy_type}'")
+
+    if not strategy_type:
+        logger.error("Strategy 'type' not specified in configuration or override.")
+        return None
+
+    strategy_type_lower = strategy_type.lower()
+
+    try:
+        if strategy_type_lower == "simple_weed":
+            config_for_simple = strategy_config.get('simple_weed', {})
+            if not config_for_simple: logger.warning(f"No config under 'strategy.simple_weed'.")
+            return SimpleWeedStrategy(config_for_simple, logger, clock)
+
+        elif strategy_type_lower == "spray_all":
+            config_for_spray_all = strategy_config.get('spray_all', {})
+            if not config_for_spray_all: logger.warning(f"No config under 'strategy.spray_all'.")
+            return SprayAllStrategy(config_for_spray_all, logger, clock)
+
+        elif strategy_type_lower == "macro_strategy":
+            config_for_macro = strategy_config.get('macro_strategy', {})
+            if not config_for_macro: logger.warning(f"No config under 'strategy.macro_strategy'.")
+            return MarcoStrategy(config_for_macro, logger, clock)
+
+        elif strategy_type_lower == "no_spray":
+            config_for_no_spray = strategy_config.get('no_spray', {}) # Allows for future config if needed
+            if not config_for_no_spray: logger.debug(f"No specific config under 'strategy.no_spray', using defaults.")
+            return NoSprayStrategy(config_for_no_spray, logger, clock)
+
+
+        # --- Add other strategies here ---
+        # elif strategy_type_lower == "marco_strat1":
+        #     config_for_macro_strat1 = strategy_config.get('marco_strat1', {})
+        #     ...
+        # ---------------------------------
+
+        else:
+            logger.error(f"Unknown spraying strategy type specified: '{strategy_type}'")
+            return None
+
+    except KeyError as e:
+        logger.error(f"Missing configuration key expected by strategy '{strategy_type}': {e}")
+        return None
+    except ValueError as e:
+        logger.error(f"Invalid configuration value for strategy '{strategy_type}': {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error creating strategy instance of type '{strategy_type}': {e}")
+        logger.error(traceback.format_exc())
+        return None
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/strategy/spray_all_strategy.py`:
+
+```py
+import logging
+from typing import Dict, Any, Set, List
+from rclpy.clock import Clock
+from .base_strategy import BaseSprayStrategy
+from ..common.definitions import ManagedObject
+
+class SprayAllStrategy(BaseSprayStrategy):
+    def __init__(self, strategy_config: Dict[str, Any], logger: logging.Logger, clock: Clock):
+        super().__init__(strategy_config, logger, clock)
+        self._logger.info(f"Initializing {self.__class__.__name__}...")
+
+        try:
+            crop_names_list: List[str] = self._config.get('crop_class_names', [])
+            if not isinstance(crop_names_list, list):
+                raise ValueError("'crop_class_names' must be a list of strings.")
+            self._crop_class_names: Set[str] = set(crop_names_list)
+
+            self._min_confidence: float = float(self._config.get('min_confidence', 0.4))
+            if not (0.0 <= self._min_confidence <= 1.0):
+                raise ValueError("min_confidence must be between 0.0 and 1.0")
+
+            self._safety_zone_cm: float = float(self._config.get('safety_zone_in_cm', 0.0))
+            if self._safety_zone_cm < 0.0:
+                self._logger.warning(f"safety_zone_in_cm ({self._safety_zone_cm}cm) is negative. Clamping to 0.0cm.")
+                self._safety_zone_cm = 0.0
+            self._safety_zone_m: float = self._safety_zone_cm / 100.0
+
+            self._parse_common_constraints() 
+
+        except (ValueError, TypeError) as e:
+            self._logger.error(f"Configuration error for {self.__class__.__name__}: {e}")
+            raise ValueError(f"Configuration error in {self.__class__.__name__}") from e
+
+        if not self._crop_class_names:
+            self._logger.warning("No 'crop_class_names' configured for SimpleWeedStrategy. All non-low-confidence objects might be targeted.")
+        else:
+            self._logger.info(f"  Crop Classes (Protected): {sorted(list(self._crop_class_names))}")
+            self._logger.info(f"  Safety Zone for Protected Classes: {self._safety_zone_cm:.1f} cm ({self._safety_zone_m:.3f} m)")
+        self._logger.info(f"  Min Confidence Threshold: {self._min_confidence:.2f}")
+
+
+    def decide(self, target: ManagedObject) -> bool:
+        if target.confidence < self._min_confidence:
+            return False 
+
+        # Avoid min size in meters
+        obj_width_m, obj_length_m = target.size_m
+        if obj_width_m <= 0.005 and obj_length_m <= 0.005: # 5mm
+            return False
+
+        if target.class_name in self._crop_class_names:
+            return False # Do not spray crops
+
+        return True # Spray if it's not a crop and meets confidence/size
+
+    def get_safety_zone_m(self, target: ManagedObject) -> float:
+        return 0.0
+
+    def get_min_target_coverage_ratio(self) -> float:
+        return self._min_coverage
+
+    def get_max_nontarget_overspray_ratio(self) -> float:
+        return self._max_overspray
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/strategy/macro_strategy.py`:
+
+```py
+import logging
+from typing import Dict, Any, Set, List
+from rclpy.clock import Clock
+from .base_strategy import BaseSprayStrategy
+from ..common.definitions import ManagedObject
+
+SPRAY_SPECIES = {"TAROF", "CHEAL", "EQUAR", "1MATG",
+                 "GALAP", "SINAR", "1CRUF", "CIRAR", "POLCO"}
+PRESERVE_SPECIES = {"PIBSA", "VIOAR", "GERMO", "EPHHE", "LAMPU"}
+CHECK_SIZE_SPECIES = {"FUMOF", "POLLA", "POLAV", "ATXPA", "VERPE"}
+CONFIDENCE = 0.4
+
+class MarcoStrategy(BaseSprayStrategy):
+    def __init__(self, strategy_config: Dict[str, Any], logger: logging.Logger, clock: Clock):
+        super().__init__(strategy_config, logger, clock)
+        self._logger.info(f"Initializing {self.__class__.__name__}...")
+        self.spray_list = SPRAY_SPECIES
+        self.preserve_list = PRESERVE_SPECIES
+        self.check_size_list = CHECK_SIZE_SPECIES
+        self.confidence = CONFIDENCE
+
+    def decide(self, target: ManagedObject) -> bool:
+        species = target.species
+        size = target.bounding_box_size
+        confidence = target.confidence
+
+        # below threshold confidence, do not spray
+        if confidence < self.confidence:
+            return False
+
+        if species in self.spray_list:
+            return True
+        elif species in self.preserve_list:
+            return False
+        elif species in self.check_size_list:
+            # Check the size condition
+            if size > 40:
+                return True
+            else:
+                return False
+        else:
+            # For unknown species, check the size condition
+            if size > 40:
+                return True
+            else:
+                return False
+
+    def get_min_target_coverage_ratio(self) -> float:
+        return self._min_coverage
+
+    def get_max_nontarget_overspray_ratio(self) -> float:
+        return self._max_overspray
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/strategy/__init__.py`:
+
+```py
+from .base_strategy import BaseSprayStrategy
+from .factory import create_spraying_strategy
+from .no_spray_strategy import NoSprayStrategy
+from .simple_weed_strategy import SimpleWeedStrategy
+from .spray_all_strategy import SprayAllStrategy
+from .macro_strategy import MarcoStrategy
+
+
+__all__ = [
+    'BaseSprayStrategy',
+    'create_spraying_strategy',
+    'NoSprayStrategy',
+    'SimpleWeedStrategy',
+    'SprayAllStrategy',
+    'MarcoStrategy',
+]
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/object_management/object_manager.py`:
+
+```py
+import threading
+import time
+import logging
+from typing import Dict, List, Optional, Tuple, Any
+
+from rclpy.time import Time, Duration
+from rclpy.clock import Clock
+from std_msgs.msg import Header
+from vision_interfaces.msg import TrackedObject as TrackedObjectMsg
+
+from ..common.definitions import ManagedObject, ObjectStatus, DisplayObjectState, CameraParams
+from ..motion import MotionModel
+from ..common import geometry 
+from ..strategy import BaseSprayStrategy
+
+class ObjectManager:
+    def __init__(self,
+                 config: Dict[str, Any],
+                 motion_model: MotionModel,
+                 cam_params: CameraParams,
+                 initial_strategy: BaseSprayStrategy, 
+                 logger: logging.Logger,
+                 clock: Clock):
+        self._config = config
+        self._motion_model = motion_model
+        self._cam_params = cam_params
+        self._strategy = initial_strategy 
+        self._logger = logger
+        self._clock = clock
+        self._objects: Dict[int, ManagedObject] = {}
+        self._lock = threading.RLock()
+        self._last_prediction_mono_time: Optional[float] = None
+
+        om_config = self._config.get('object_management', {})
+        self._activation_zone_object_width_px = om_config.get('activation_zone_object_width_px', -1.0)
+        if self._activation_zone_object_width_px > 0:
+            logger.info(f"ObjectManager: Object activation zone width will be shrunk to {self._activation_zone_object_width_px:.1f} px if smaller than original.")
+        else:
+            logger.info("ObjectManager: Object activation zone width shrinkage is disabled.")
+
+        self._logger.info(f"ObjectManager initialized. Initial Strategy: {self._strategy.__class__.__name__}")
+        self._logger.info(f"  Transforms based on image size: {self._cam_params.width_px}x{self._cam_params.height_px}")
+        self._logger.info(f"  Using simplified GSD model: {1.0/self._cam_params.m_per_px:.1f} px/m")
+
+    def set_strategy(self, new_strategy: BaseSprayStrategy):
+        if new_strategy is None:
+            self._logger.error("Attempted to set a null strategy.")
+            return
+
+        with self._lock: 
+            old_strategy_name = self._strategy.__class__.__name__
+            new_strategy_name = new_strategy.__class__.__name__
+            if old_strategy_name == new_strategy_name:
+                self._logger.info(f"Strategy is already set to {new_strategy_name}. No change.")
+                return
+
+            self._logger.info(f"Switching strategy from {old_strategy_name} to {new_strategy_name}...")
+            self._strategy = new_strategy
+
+            re_eval_statuses = [ObjectStatus.PENDING, ObjectStatus.TARGETED, ObjectStatus.IGNORED]
+            num_re_evaluated = 0
+            status_changes = 0
+            keys_to_iterate = list(self._objects.keys())
+
+            for track_id in keys_to_iterate:
+                if track_id not in self._objects: continue 
+                obj = self._objects[track_id]
+                if obj.status in re_eval_statuses:
+                    try:
+                        old_status = obj.status
+                        decision_result = self._strategy.decide(obj) 
+                        new_status = ObjectStatus.TARGETED if decision_result else ObjectStatus.IGNORED
+                        obj.status = new_status
+                        num_re_evaluated += 1
+                        if old_status != new_status:
+                            status_changes += 1
+                        
+                        safety_m = self._strategy.get_safety_zone_m(obj)
+                        obj.update_bounding_boxes(self._cam_params, self._activation_zone_object_width_px, safety_m)
+
+                    except Exception as strategy_e:
+                        self._logger.error(f"  Error re-applying new strategy to target {track_id}: {strategy_e}")
+                        obj.status = ObjectStatus.PENDING 
+                        obj.update_bounding_boxes(self._cam_params, self._activation_zone_object_width_px, 0.0)
+
+
+            self._logger.info(f"Strategy switched to {new_strategy_name}. Re-evaluated {num_re_evaluated} objects ({status_changes} status changes).")
+
+    def update_from_tracking(self, tracked_objects: List[TrackedObjectMsg], message_header: Header):
+        message_time = Time.from_msg(message_header.stamp)
+
+        with self._lock: 
+            updated_ids = set()
+            strategy_decisions_made = 0
+            status_changes = 0
+
+            for obj_msg in tracked_objects:
+                track_id = obj_msg.track_id
+                updated_ids.add(track_id)
+
+                center_img_px = (obj_msg.center_x, obj_msg.center_y)
+                bbox_img_px = (obj_msg.bbox_x, obj_msg.bbox_y, obj_msg.bbox_width, obj_msg.bbox_height)
+
+                try:
+                    position_ground_m = geometry.image_px_to_robot_ground_m(center_img_px, self._cam_params)
+                    size_ground_m = geometry.estimate_object_size_m(bbox_img_px, self._cam_params)
+                except Exception as e:
+                    self._logger.error(f"Error transforming track {track_id} coordinates: {e}. Skipping.")
+                    continue
+
+                current_vision_class_name = obj_msg.class_name
+                current_vision_confidence = obj_msg.confidence
+
+                existing_object = self._objects.get(track_id)
+                safety_m = 0.0
+
+                if existing_object:
+                    obj = existing_object
+                    obj.last_seen_time = message_time
+                    obj.bbox_image = bbox_img_px 
+                    obj.position_robot_m = position_ground_m
+                    obj.size_m = size_ground_m
+                    obj.predicted_position_robot_m = position_ground_m 
+                    
+                    strategy_input_changed = (
+                        obj.last_vision_class_name != current_vision_class_name or
+                        abs(obj.last_vision_confidence - current_vision_confidence) > 0.05 
+                    )
+
+                    obj.last_vision_class_name = current_vision_class_name
+                    obj.last_vision_confidence = current_vision_confidence
+                    obj.confidence = current_vision_confidence 
+                    obj.class_name = current_vision_class_name
+                    
+                    if obj.status == ObjectStatus.PENDING or \
+                       (strategy_input_changed and obj.status in [ObjectStatus.TARGETED, ObjectStatus.IGNORED]):
+                        try:
+                            old_status = obj.status
+                            decision_result = self._strategy.decide(obj)
+                            new_status = ObjectStatus.TARGETED if decision_result else ObjectStatus.IGNORED
+                            obj.status = new_status
+                            strategy_decisions_made += 1
+                            if old_status != new_status: status_changes += 1
+                        except Exception as strategy_e:
+                            self._logger.error(f"Error applying strategy to target {track_id}: {strategy_e}")
+                            obj.status = ObjectStatus.PENDING
+                    
+                    safety_m = self._strategy.get_safety_zone_m(obj)
+                    obj.update_bounding_boxes(self._cam_params, self._activation_zone_object_width_px, safety_m)
+
+                    if obj.status == ObjectStatus.LOST: 
+                         obj.status = ObjectStatus.PENDING
+                         self._logger.info(f"Reacquired object {track_id}, set to PENDING.")
+                else: 
+                    new_object = ManagedObject(
+                        track_id=track_id, class_id=obj_msg.class_id,
+                        class_name=current_vision_class_name, last_seen_time=message_time,
+                        bbox_image=bbox_img_px, confidence=current_vision_confidence,
+                        last_vision_class_name=current_vision_class_name,
+                        last_vision_confidence=current_vision_confidence,
+                        position_robot_m=position_ground_m,
+                        predicted_position_robot_m=position_ground_m, 
+                        size_m=size_ground_m,
+                        status=ObjectStatus.PENDING, created_time=self._clock.now()
+                    )
+                    
+                    try: 
+                        decision_result = self._strategy.decide(new_object)
+                        initial_status = ObjectStatus.TARGETED if decision_result else ObjectStatus.IGNORED
+                        new_object.status = initial_status
+                        strategy_decisions_made += 1
+                    except Exception as strategy_e:
+                        self._logger.error(f"Error applying initial strategy to {track_id}: {strategy_e}")
+                        new_object.status = ObjectStatus.PENDING
+                    
+                    safety_m = self._strategy.get_safety_zone_m(new_object)
+                    new_object.update_bounding_boxes(self._cam_params, self._activation_zone_object_width_px, safety_m)
+                    self._objects[track_id] = new_object
+
+
+    def _is_offscreen_m(self, predicted_pos_m: Tuple[float, float], size_m: Tuple[float, float]) -> bool:
+        max_lateral_m = 2.5; max_forward_m = 1.5; max_behind_m = 4.0
+        pred_x, pred_y = predicted_pos_m; half_width = size_m[0] / 2.0; half_length = size_m[1] / 2.0
+        if (pred_x + half_width) < -max_lateral_m or (pred_x - half_width) > max_lateral_m: return True
+        if (pred_y + half_length) < -max_behind_m or (pred_y - half_length) > max_forward_m: return True
+        return False
+
+    def update_predictions_and_get_display_state(self) -> List[DisplayObjectState]:
+        current_mono_time = time.monotonic()
+        display_list = []; ids_to_remove = []
+        dt = 0.0
+        if self._last_prediction_mono_time is not None: 
+            dt = max(0.0, min(current_mono_time - self._last_prediction_mono_time, 0.1))
+        self._last_prediction_mono_time = current_mono_time
+        
+        vx_mps, vy_mps = self._motion_model.get_velocity_mps()
+        dx_m = vx_mps * dt
+        dy_m = vy_mps * dt
+        
+        gui_width = self._config.get('debug',{}).get('gui_width', self._cam_params.width_px)
+        gui_height = self._config.get('debug',{}).get('gui_height', self._cam_params.height_px)
+        scale_x = gui_width / self._cam_params.width_px if self._cam_params.width_px > 0 else 1.0
+        scale_y = gui_height / self._cam_params.height_px if self._cam_params.height_px > 0 else 1.0
+
+        with self._lock:
+            keys_to_iterate = list(self._objects.keys())
+            for track_id in keys_to_iterate:
+                 if track_id not in self._objects: continue
+                 obj = self._objects[track_id]
+                 
+                 pred_x_m = obj.predicted_position_robot_m[0] + dx_m
+                 pred_y_m = obj.predicted_position_robot_m[1] + dy_m
+                 obj.predicted_position_robot_m = (pred_x_m, pred_y_m)
+
+                 safety_m = 0.0
+                 if self._strategy:
+                     try:
+                         safety_m = self._strategy.get_safety_zone_m(obj)
+                     except Exception as e_strat:
+                         self._logger.error(f"Error getting safety zone for obj {obj.track_id} from strategy: {e_strat}")
+                 
+                 obj.update_bounding_boxes(self._cam_params, 
+                                           self._activation_zone_object_width_px,
+                                           safety_margin_m=safety_m)
+
+                 if self._is_offscreen_m(obj.predicted_position_robot_m, obj.size_m): 
+                     ids_to_remove.append(track_id)
+                     continue
+                 
+                 pred_center_px_unscaled: Tuple[float, float]
+                 try: 
+                     pred_center_px_unscaled = geometry.robot_ground_m_to_image_px(obj.predicted_position_robot_m, self._cam_params)
+                 except Exception as e: 
+                     self._logger.error(f"Error transforming {track_id} to pixels for display: {e}")
+                     continue
+                
+                 # Scale for GUI
+                 pred_center_gui_px = (pred_center_px_unscaled[0] * scale_x, pred_center_px_unscaled[1] * scale_y)
+
+                 original_dims_gui_px = (obj.bbox_image[2] * scale_x, obj.bbox_image[3] * scale_y) 
+
+                 activation_width_px_unscaled = obj.bbox_image[2]
+                 if self._activation_zone_object_width_px is not None and \
+                    0 < self._activation_zone_object_width_px < activation_width_px_unscaled:
+                     activation_width_px_unscaled = self._activation_zone_object_width_px
+                 
+                 activation_dims_gui_px = (activation_width_px_unscaled * scale_x, obj.bbox_image[3] * scale_y)
+
+                 safety_bbox_gui_px_val: Optional[Tuple[float,float,float,float]] = None
+                 if obj.safety_bounding_box_m:
+                     s_min_m_x, s_min_m_y, s_max_m_x, s_max_m_y = obj.safety_bounding_box_m
+                     s_min_px_unscaled = geometry.robot_ground_m_to_image_px((s_min_m_x, s_min_m_y), self._cam_params)
+                     s_max_px_unscaled = geometry.robot_ground_m_to_image_px((s_max_m_x, s_max_m_y), self._cam_params)
+                     safety_bbox_gui_px_val = (
+                         s_min_px_unscaled[0] * scale_x, s_min_px_unscaled[1] * scale_y,
+                         s_max_px_unscaled[0] * scale_x, s_max_px_unscaled[1] * scale_y
+                     )
+
+                 label = (f"{obj.track_id}:{obj.class_name}:{obj.confidence:.2f}")
+                 display_list.append(DisplayObjectState(
+                     track_id=obj.track_id, 
+                     predicted_center_image_px=pred_center_gui_px, # Already scaled
+                     original_bbox_dims_px=original_dims_gui_px,   # Already scaled
+                     activation_bbox_dims_px=activation_dims_gui_px, # Already scaled
+                     label=label, 
+                     status=obj.status,
+                     safety_bbox_gui_px=safety_bbox_gui_px_val # Already scaled
+                 ))
+
+            if ids_to_remove:
+                num_removed = 0
+                for track_id in ids_to_remove:
+                    if track_id in self._objects: del self._objects[track_id]; num_removed += 1
+                if num_removed > 0: self._logger.debug(f"Removed {num_removed} off-screen objects.")
+        return display_list
+
+    def get_all_managed_objects(self) -> List[ManagedObject]:
+        with self._lock:
+            for obj in self._objects.values():
+                 safety_m = 0.0
+                 if self._strategy:
+                     try:
+                         safety_m = self._strategy.get_safety_zone_m(obj)
+                     except Exception as e_strat:
+                         self._logger.error(f"Error getting safety zone for obj {obj.track_id} from strategy: {e_strat}")
+                 
+                 if obj.bounding_box_m is None or obj.activation_bounding_box_m is None or \
+                    (safety_m > 0 and obj.safety_bounding_box_m is None) or \
+                     abs(obj.current_safety_margin_m - safety_m) > 1e-4 :
+                     obj.update_bounding_boxes(self._cam_params, 
+                                               self._activation_zone_object_width_px,
+                                               safety_margin_m=safety_m)
+            return list(self._objects.values())
+
+    def get_targets_by_status(self, statuses: List[ObjectStatus]) -> List[ManagedObject]:
+        matching_objects = []
+        all_objects = self.get_all_managed_objects() 
+        with self._lock: 
+            for obj in all_objects:
+                if obj.status in statuses:
+                    matching_objects.append(obj)
+        return matching_objects
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/object_management/__init__.py`:
+
+```py
+from .object_manager import ObjectManager
+
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/visualization/debug_gui.py`:
+
+```py
+import threading
+import time
+from typing import List, Optional, Dict, Any, Tuple, Callable
+import logging
+from rclpy.time import Duration
+
+try:
+    import cv2
+    import numpy as np
+    OPENCV_AVAILABLE = True
+except ImportError:
+    OPENCV_AVAILABLE = False
+    print("[WARN] DebugGui: OpenCV not found, GUI functionality will be unavailable.")
+
+
+from rclpy.clock import Clock
+from ..common.definitions import DisplayObjectState, ObjectStatus, CameraParams, ManagedObject, Nozzle
+from ..planning.nozzle_configuration import NozzleConfiguration
+from ..common import geometry
+
+STATUS_COLORS: Dict[ObjectStatus, Tuple[int, int, int]] = {
+    ObjectStatus.PENDING: (0, 255, 255),      # Yellow
+    ObjectStatus.TARGETED: (0, 255, 0),       # Green
+    ObjectStatus.IGNORED: (0, 0, 255),        # Red
+    ObjectStatus.SCHEDULED: (255, 0, 0),      # Blue
+    ObjectStatus.SPRAYING: (255, 0, 255),     # Magenta
+    ObjectStatus.SPRAYED: (128, 128, 128),    # Gray
+    ObjectStatus.MISSED: (0, 165, 255),       # Orange
+    ObjectStatus.LOST: (50, 50, 50),          # Dark Gray
+    ObjectStatus.APPROACHING: (255, 255, 0),  # Cyan
+}
+DEFAULT_COLOR = (255, 255, 255) 
+
+NOZZLE_MARKER_COLOR_OFF = (255, 165, 0) 
+NOZZLE_MARKER_COLOR_ON = (0, 220, 0)   
+NOZZLE_MARKER_RADIUS_OFF = 4
+NOZZLE_MARKER_RADIUS_ON = 5 
+NOZZLE_MARKER_BORDER_COLOR_ON = (0,0,0) 
+NOZZLE_PATTERN_COLOR = (100, 100, 100) 
+NOZZLE_PATTERN_THICKNESS = 1
+
+ACTIVATION_LINE_COLOR_OFF = (0, 180, 180)  
+ACTIVATION_LINE_COLOR_ON = NOZZLE_MARKER_COLOR_ON 
+ACTIVATION_LINE_THICKNESS = 1
+
+SCHEDULED_MARKER_COLOR = (255, 255, 255) 
+SCHEDULED_MARKER_OFFSET_Y_FROM_LINE = -5 
+SCHEDULED_MARKER_SCALE_FACTOR = 0.7 
+
+SPRAY_FILL_COLOR = STATUS_COLORS[ObjectStatus.SPRAYING] 
+
+SAFETY_ZONE_OUTLINE_COLOR = (0, 0, 180) # Darker Red for outline
+SAFETY_ZONE_THICKNESS = 1
+SAFETY_ZONE_FILL_COLOR = (0, 0, 100) # Dark Red Fill
+SAFETY_ZONE_FILL_OPACITY = 0.5
+
+
+BUTTON_HEIGHT = 30; BUTTON_SPACING = 5; BUTTON_START_Y = 5; BUTTON_WIDTH = 150
+BUTTON_DEFS = [
+    ((BUTTON_SPACING, BUTTON_START_Y, BUTTON_WIDTH, BUTTON_HEIGHT), "simple_weed", "Simple Weed"),
+    ((BUTTON_SPACING * 2 + BUTTON_WIDTH, BUTTON_START_Y, BUTTON_WIDTH, BUTTON_HEIGHT), "spray_all", "Spray All"),
+]
+BUTTON_TEXT_COLOR = (0, 0, 0); BUTTON_DEFAULT_BG = (180, 180, 180); BUTTON_HIGHLIGHT_BG = (220, 220, 220)
+
+LEADING_EDGE_COLOR = (0, 0, 255); TRAILING_EDGE_COLOR = (0, 165, 255); EDGE_LINE_THICKNESS = 1
+
+
+class DebugGui:
+    def __init__(self,
+                 gui_config: Dict[str, Any],
+                 node_config: Dict[str, Any], 
+                 node_clock: Clock,
+                 node_logger: logging.Logger,
+                 strategy_change_callback: Callable[[str], None]):
+
+        self._enabled = gui_config.get('enable_gui', False) and OPENCV_AVAILABLE
+        self._config = gui_config
+        self._node_config = node_config
+        self._clock = node_clock
+        self._logger = node_logger
+        self._strategy_change_callback = strategy_change_callback
+
+        self._thread: Optional[threading.Thread] = None
+        self._shutdown_event = threading.Event()
+        self._data_lock = threading.Lock()
+
+        self._current_display_states: List[DisplayObjectState] = []
+        self._current_scheduled_objects: List[ManagedObject] = []
+        self._current_nozzle_config: Optional[NozzleConfiguration] = None
+        self._current_target_nozzle_map: Dict[int, List[int]] = {}
+        self._current_nozzle_command: List[bool] = []
+
+        self._gps_lock = threading.Lock()
+        self._latest_gps_speed: Optional[float] = None
+        self._latest_gps_track: Optional[float] = None
+
+        self._active_strategy_lock = threading.Lock()
+        self._active_strategy_name: str = node_config.get('strategy', {}).get('type', 'unknown').lower()
+
+        self._window_name = self._config.get('gui_window_name', 'Sprayer Debug')
+        self._gui_width = self._config.get('gui_width', 1232)
+        self._gui_height = self._config.get('gui_height', 704)
+        self._update_rate = self._config.get('gui_update_rate', 30.0)
+        self._wait_ms = max(1, int(1000 / self._update_rate)) if self._update_rate > 0 else 33
+
+        self._text_color = tuple(self._config.get('gui_text_color', [255, 255, 255]))
+        self._font_scale = self._config.get('gui_font_scale', 0.5)
+        self._font_thickness = self._config.get('gui_font_thickness', 1)
+        self._font_face = cv2.FONT_HERSHEY_SIMPLEX if OPENCV_AVAILABLE else None
+        self._obj_fill_opacity = self._config.get('gui_object_fill_opacity', 0.4)
+        self._spray_fill_opacity = self._config.get('gui_spray_fill_opacity', 0.6) 
+        self._outline_thickness = 1
+        self._outline_color = (255,255,255) 
+        self._object_activation_zone_color = tuple(self._config.get('gui_object_activation_zone_color', [100, 255, 100]))
+
+
+        self._cam_params: Optional[CameraParams] = None
+        self._latency_sec: float = 0.0 
+        self._source_width: int = self._gui_width 
+        self._source_height: int = self._gui_height
+
+        if self._enabled:
+            try:
+                cam_params_dict = self._node_config.get('camera_parameters', {})
+                self._cam_params = CameraParams(
+                    width_px=cam_params_dict['image_width_px'],
+                    height_px=cam_params_dict['image_height_px'],
+                    gsd_px_per_m=cam_params_dict['gsd_px_per_meter']
+                )
+                self._source_width = self._cam_params.width_px
+                self._source_height = self._cam_params.height_px
+                
+                timing_config = self._node_config.get('timing', {})
+                self._latency_sec = float(timing_config.get('nozzle_actuation_latency', 0.050))
+                self._logger.info(f"DebugGUI Initialized. GUI Size: {self._gui_width}x{self._gui_height}. "
+                                  f"Source Image: {self._source_width}x{self._source_height}. "
+                                  f"Latency for viz: {self._latency_sec:.3f}s")
+            except (KeyError, ValueError, TypeError) as e:
+                self._logger.error(f"DebugGUI: Error parsing camera/timing params from node_config: {e}. GUI disabled.")
+                self._enabled = False
+        else: 
+            if not OPENCV_AVAILABLE: self._logger.warn("DebugGUI disabled: OpenCV not available.")
+            else: self._logger.info("DebugGUI explicitly disabled in configuration.")
+
+
+    def update_active_strategy_name(self, name: str):
+        with self._active_strategy_lock:
+            self._active_strategy_name = name.lower()
+
+    def start(self):
+        if not self._enabled:
+            return
+        if self._thread is not None and self._thread.is_alive():
+            self._logger.warn("DebugGUI thread already started.")
+            return
+        
+        self._logger.info("Starting DebugGUI thread...")
+        self._shutdown_event.clear()
+        with self._data_lock: 
+            self._current_display_states.clear()
+            self._current_scheduled_objects.clear()
+            self._current_nozzle_config = None
+            self._current_target_nozzle_map.clear()
+            self._current_nozzle_command.clear()
+        with self._gps_lock:
+            self._latest_gps_speed = None
+            self._latest_gps_track = None
+        
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="debug_gui_thread")
+        self._thread.start()
+
+    def stop(self):
+        if self._thread is not None and self._thread.is_alive():
+            self._logger.info("Signaling DebugGUI thread to stop...")
+            self._shutdown_event.set()
+            try:
+                self._thread.join(timeout=2.0) 
+                if self._thread.is_alive():
+                    self._logger.warn("DebugGUI thread did not exit cleanly after timeout.")
+            except Exception as e:
+                self._logger.error(f"Error joining DebugGUI thread: {e}")
+            finally:
+                self._thread = None 
+                if OPENCV_AVAILABLE:
+                    try:
+                        cv2.destroyWindow(self._window_name)
+                        cv2.waitKey(10) 
+                        self._logger.info("DebugGUI window destroyed.")
+                    except Exception as cv_e: 
+                        self._logger.warning(f"Exception during OpenCV window destruction: {cv_e}")
+        else:
+            self._logger.info("DebugGUI stop called, but thread was not running or already stopped.")
+
+
+    def update_from_gps(self, speed: Optional[float], track: Optional[float]):
+        if not self._enabled: return
+        with self._gps_lock:
+            self._latest_gps_speed = speed
+            self._latest_gps_track = track
+
+    def _mouse_callback(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            clicked_strategy_type: Optional[str] = None
+            for rect, strategy_name_code, _ in BUTTON_DEFS: 
+                bx, by, bw, bh = rect
+                if bx <= x < bx + bw and by <= y < by + bh:
+                    clicked_strategy_type = strategy_name_code
+                    break
+            if clicked_strategy_type:
+                self._logger.info(f"DebugGUI: Button '{clicked_strategy_type}' clicked.")
+                try:
+                    self._strategy_change_callback(clicked_strategy_type)
+                except Exception as e: 
+                    self._logger.error(f"Error in strategy change callback from GUI: {e}")
+
+    def update_display_data(self,
+                            display_states: List[DisplayObjectState],
+                            scheduled_objects: List[ManagedObject],
+                            nozzle_config: Optional[NozzleConfiguration],
+                            target_nozzle_map: Dict[int, List[int]],
+                            current_nozzle_command: List[bool]):
+        if not self._enabled: return
+        with self._data_lock:
+            self._current_display_states = list(display_states)
+            self._current_scheduled_objects = list(scheduled_objects)
+            self._current_nozzle_config = nozzle_config
+            self._current_target_nozzle_map = dict(target_nozzle_map)
+            self._current_nozzle_command = list(current_nozzle_command)
+
+    def _run_loop(self):
+        if not OPENCV_AVAILABLE:
+            self._logger.error("DebugGUI loop cannot run: OpenCV missing.")
+            return
+
+        self._logger.info(f"DebugGUI loop started. Window: '{self._window_name}'.")
+        target_loop_freq = self._node_config.get('control_loop_frequency', 1.0)
+
+        try:
+            cv2.namedWindow(self._window_name, cv2.WINDOW_AUTOSIZE)
+            cv2.setMouseCallback(self._window_name, self._mouse_callback)
+        except Exception as e: 
+             self._logger.error(f"DebugGUI: Failed to create window/set callback: {e}. Loop terminating.")
+             return
+
+        last_fps_calc_time_mono = time.monotonic()
+        frame_count = 0
+        display_fps = 0.0
+
+        while not self._shutdown_event.is_set():
+            current_mono_time = time.monotonic()
+            with self._data_lock:
+                display_states_snapshot = self._current_display_states
+                scheduled_objects_snapshot = self._current_scheduled_objects 
+                nozzle_config_snapshot = self._current_nozzle_config
+                target_nozzle_map_snapshot = self._current_target_nozzle_map 
+                nozzle_command_snapshot = self._current_nozzle_command 
+            with self._gps_lock:
+                current_gps_speed = self._latest_gps_speed
+                current_gps_track = self._latest_gps_track
+            with self._active_strategy_lock:
+                active_strategy = self._active_strategy_name
+
+            canvas = np.zeros((self._gui_height, self._gui_width, 3), dtype=np.uint8)
+            obj_overlay = canvas.copy()
+            spray_overlay = canvas.copy()
+            safety_zone_overlay = canvas.copy()
+
+            actually_spraying_nozzle_indices = set()
+            for obj_managed in scheduled_objects_snapshot:
+                if obj_managed.status == ObjectStatus.SPRAYING:
+                    actually_spraying_nozzle_indices.update(obj_managed.assigned_nozzle_indices)
+            
+            scheduled_nozzle_indices = set()
+            for obj_managed in scheduled_objects_snapshot:
+                 if obj_managed.status == ObjectStatus.SCHEDULED and obj_managed.assigned_nozzle_indices:
+                      scheduled_nozzle_indices.update(obj_managed.assigned_nozzle_indices)
+
+            if nozzle_config_snapshot and self._cam_params:
+                num_total_nozzles = nozzle_config_snapshot.num_nozzles
+                current_command_state_per_nozzle = [False] * num_total_nozzles
+                for i, cmd_state in enumerate(nozzle_command_snapshot):
+                    if i < num_total_nozzles:
+                        current_command_state_per_nozzle[i] = cmd_state
+                
+                nozzle_draw_scale_x = self._gui_width / self._cam_params.width_px if self._cam_params.width_px > 0 else 1.0
+                nozzle_draw_scale_y = self._gui_height / self._cam_params.height_px if self._cam_params.height_px > 0 else 1.0
+
+
+                for nozzle_obj in nozzle_config_snapshot.get_all_nozzles():
+                    try:
+                        nozzle_idx = nozzle_obj.index
+                        is_commanded_on_this_tick = current_command_state_per_nozzle[nozzle_idx]
+                        
+                        gui_activation_line_y = -1
+                        gui_activation_line_start_x = -1
+                        gui_activation_line_end_x = -1
+                        gui_activation_line_center_x = -1
+
+                        if nozzle_obj.activation_y_m is not None and nozzle_obj.bounding_box_relative_m:
+                            rel_min_x, _, rel_max_x, _ = nozzle_obj.bounding_box_relative_m
+                            activation_y_ground_m = nozzle_obj.activation_y_m
+                            activation_start_x_ground_m = nozzle_obj.position_m[0] + rel_min_x
+                            activation_end_x_ground_m = nozzle_obj.position_m[0] + rel_max_x
+                            
+                            _, act_line_y_img_px = geometry.robot_ground_m_to_image_px((0.0, activation_y_ground_m), self._cam_params)
+                            act_line_start_x_img_px, _ = geometry.robot_ground_m_to_image_px((activation_start_x_ground_m, 0.0), self._cam_params)
+                            act_line_end_x_img_px, _   = geometry.robot_ground_m_to_image_px((activation_end_x_ground_m, 0.0), self._cam_params)
+
+                            gui_activation_line_y = int(act_line_y_img_px * nozzle_draw_scale_y)
+                            gui_activation_line_start_x = int(act_line_start_x_img_px * nozzle_draw_scale_x)
+                            gui_activation_line_end_x = int(act_line_end_x_img_px * nozzle_draw_scale_x)
+                            gui_activation_line_center_x = (gui_activation_line_start_x + gui_activation_line_end_x) // 2
+                            
+                            current_activation_line_color = ACTIVATION_LINE_COLOR_ON if is_commanded_on_this_tick else ACTIVATION_LINE_COLOR_OFF
+                            cv2.line(canvas, (gui_activation_line_start_x, gui_activation_line_y), 
+                                     (gui_activation_line_end_x, gui_activation_line_y), 
+                                     current_activation_line_color, ACTIVATION_LINE_THICKNESS)
+                        
+                        marker_gui_x, marker_gui_y = -1, -1
+                        if gui_activation_line_center_x != -1 and gui_activation_line_y != -1:
+                            marker_gui_x, marker_gui_y = gui_activation_line_center_x, gui_activation_line_y
+                        else:
+                            abs_nz_physical_x_m, abs_nz_physical_y_m = nozzle_obj.position_m
+                            abs_nz_img_px_x, abs_nz_img_px_y = geometry.robot_ground_m_to_image_px((abs_nz_physical_x_m, abs_nz_physical_y_m), self._cam_params)
+                            marker_gui_x = int(abs_nz_img_px_x * nozzle_draw_scale_x)
+                            marker_gui_y = int(abs_nz_img_px_y * nozzle_draw_scale_y)
+
+                        if marker_gui_x != -1:
+                            current_marker_radius = NOZZLE_MARKER_RADIUS_ON if is_commanded_on_this_tick else NOZZLE_MARKER_RADIUS_OFF
+                            current_marker_color = NOZZLE_MARKER_COLOR_ON if is_commanded_on_this_tick else NOZZLE_MARKER_COLOR_OFF
+                            cv2.circle(canvas, (marker_gui_x, marker_gui_y), current_marker_radius, current_marker_color, -1)
+                            if is_commanded_on_this_tick:
+                                 cv2.circle(canvas, (marker_gui_x, marker_gui_y), current_marker_radius, NOZZLE_MARKER_BORDER_COLOR_ON, 1)
+                        
+                        pattern_gui_pts_for_fill = None
+                        if nozzle_obj.spray_pattern_relative_m:
+                            abs_nz_physical_x_m, abs_nz_physical_y_m = nozzle_obj.position_m
+                            pattern_vertices_gui_px = []
+                            for rel_m_x, rel_m_y in nozzle_obj.spray_pattern_relative_m:
+                                abs_pattern_vertex_x_m = abs_nz_physical_x_m + rel_m_x
+                                abs_pattern_vertex_y_m = abs_nz_physical_y_m + rel_m_y
+                                abs_pattern_vertex_img_px_x, abs_pattern_vertex_img_px_y = geometry.robot_ground_m_to_image_px(
+                                    (abs_pattern_vertex_x_m, abs_pattern_vertex_y_m), self._cam_params
+                                )
+                                pattern_vertices_gui_px.append(
+                                    (int(abs_pattern_vertex_img_px_x * nozzle_draw_scale_x), 
+                                     int(abs_pattern_vertex_img_px_y * nozzle_draw_scale_y))
+                                )
+                            if pattern_vertices_gui_px:
+                                pattern_gui_pts_for_fill = np.array(pattern_vertices_gui_px, dtype=np.int32).reshape((-1,1,2))
+                                cv2.polylines(canvas, [pattern_gui_pts_for_fill], isClosed=True, color=NOZZLE_PATTERN_COLOR, thickness=NOZZLE_PATTERN_THICKNESS)
+                        
+                        if nozzle_idx in scheduled_nozzle_indices and gui_activation_line_center_x != -1 and gui_activation_line_y != -1:
+                            s_text_size, _ = cv2.getTextSize("S", self._font_face, self._font_scale * SCHEDULED_MARKER_SCALE_FACTOR, self._font_thickness)
+                            s_text_w, s_text_h = s_text_size
+                            s_marker_pos_x = gui_activation_line_center_x - s_text_w // 2
+                            s_marker_pos_y = gui_activation_line_y + SCHEDULED_MARKER_OFFSET_Y_FROM_LINE + s_text_h // 2
+                            cv2.putText(canvas, "S", (s_marker_pos_x, s_marker_pos_y), self._font_face,
+                                        self._font_scale * SCHEDULED_MARKER_SCALE_FACTOR, 
+                                        SCHEDULED_MARKER_COLOR, self._font_thickness, cv2.LINE_AA)
+                        
+                        if pattern_gui_pts_for_fill is not None and nozzle_idx in actually_spraying_nozzle_indices:
+                            cv2.fillPoly(spray_overlay, [pattern_gui_pts_for_fill], SPRAY_FILL_COLOR)
+
+                    except Exception as e: 
+                        self._logger.warning(f"DebugGUI: Error drawing nozzle {nozzle_obj.index}: {e}", throttle_duration_sec=10)
+            
+            for state in display_states_snapshot:
+                if state.safety_bbox_gui_px:
+                    try:
+                        s_x1, s_y1, s_x2, s_y2 = map(int, state.safety_bbox_gui_px)
+                        if s_x2 > s_x1 and s_y1 < s_y2 :
+                             cv2.rectangle(safety_zone_overlay, (s_x1, s_y1), (s_x2, s_y2), 
+                                           SAFETY_ZONE_FILL_COLOR, -1) # Fill on overlay
+                             cv2.rectangle(canvas, (s_x1, s_y1), (s_x2, s_y2), 
+                                           SAFETY_ZONE_OUTLINE_COLOR, SAFETY_ZONE_THICKNESS) # Outline on canvas
+                    except Exception as e_sz:
+                         self._logger.warning(f"DebugGUI: Error drawing safety zone for obj {state.track_id}: {e_sz}", throttle_duration_sec=10)
+
+
+            for state in display_states_snapshot:
+                try:
+                    gui_pred_center_x = int(state.predicted_center_image_px[0])
+                    gui_pred_center_y = int(state.predicted_center_image_px[1])
+
+                    orig_w_px_scaled = int(state.original_bbox_dims_px[0])
+                    orig_h_px_scaled = int(state.original_bbox_dims_px[1])
+
+                    gui_x1_orig = max(0, gui_pred_center_x - orig_w_px_scaled // 2)
+                    gui_y1_orig = max(0, gui_pred_center_y - orig_h_px_scaled // 2)
+                    gui_x2_orig = min(self._gui_width -1, gui_pred_center_x + orig_w_px_scaled // 2)
+                    gui_y2_orig = min(self._gui_height-1, gui_pred_center_y + orig_h_px_scaled // 2)
+
+                    if gui_x2_orig > gui_x1_orig and gui_y2_orig > gui_y1_orig :
+                        fill_color = STATUS_COLORS.get(state.status, DEFAULT_COLOR)
+                        cv2.rectangle(obj_overlay, (gui_x1_orig, gui_y1_orig), (gui_x2_orig, gui_y2_orig), fill_color, -1) 
+                        cv2.rectangle(canvas, (gui_x1_orig, gui_y1_orig), (gui_x2_orig, gui_y2_orig), self._outline_color, self._outline_thickness) 
+                        cv2.line(canvas, (gui_x1_orig, gui_y1_orig), (gui_x2_orig, gui_y1_orig), LEADING_EDGE_COLOR, EDGE_LINE_THICKNESS)
+                        cv2.line(canvas, (gui_x1_orig, gui_y2_orig), (gui_x2_orig, gui_y2_orig), TRAILING_EDGE_COLOR, EDGE_LINE_THICKNESS)
+
+                        act_w_px_scaled = int(state.activation_bbox_dims_px[0])
+                        
+                        if abs(state.activation_bbox_dims_px[0] - state.original_bbox_dims_px[0]) > 1e-2: 
+                            gui_x1_act = max(0, gui_pred_center_x - act_w_px_scaled // 2)
+                            gui_y1_act = gui_y1_orig 
+                            gui_x2_act = min(self._gui_width - 1, gui_pred_center_x + act_w_px_scaled // 2)
+                            gui_y2_act = gui_y2_orig 
+
+                            if gui_x2_act > gui_x1_act and gui_y2_act > gui_y1_act:
+                                cv2.rectangle(canvas, (gui_x1_act, gui_y1_act), (gui_x2_act, gui_y2_act),
+                                              self._object_activation_zone_color, self._outline_thickness)
+                        
+                        text_y_pos = gui_y1_orig - 5 if gui_y1_orig > 15 else gui_y2_orig + 15
+                        cv2.putText(canvas, state.label, (gui_x1_orig, text_y_pos), self._font_face,
+                                    self._font_scale, self._text_color, self._font_thickness, cv2.LINE_AA)
+                except Exception as e: 
+                    self._logger.warning(f"DebugGUI: Error drawing object {state.track_id}: {e}", throttle_duration_sec=10)
+            
+            # Blend overlays
+            cv2.addWeighted(safety_zone_overlay, SAFETY_ZONE_FILL_OPACITY, canvas, 1.0, 0, canvas)
+            cv2.addWeighted(obj_overlay, self._obj_fill_opacity, canvas, 1.0, 0, canvas)
+            cv2.addWeighted(spray_overlay, self._spray_fill_opacity, canvas, 1.0, 0, canvas)
+
+            text_y_pos = BUTTON_START_Y + BUTTON_HEIGHT + BUTTON_SPACING * 2
+            line_height = 18 
+
+            for rect_def, strategy_code, display_name in BUTTON_DEFS:
+                bx, by, bw, bh = rect_def
+                current_button_bg_color = BUTTON_HIGHLIGHT_BG if strategy_code == active_strategy else BUTTON_DEFAULT_BG
+                cv2.rectangle(canvas, (bx, by), (bx+bw, by+bh), current_button_bg_color, -1)
+                cv2.rectangle(canvas, (bx, by), (bx+bw, by+bh), BUTTON_TEXT_COLOR, 1)
+                text_size, _ = cv2.getTextSize(display_name, self._font_face, self._font_scale, self._font_thickness)
+                text_w, text_h = text_size
+                cv2.putText(canvas, display_name, (bx + (bw-text_w)//2, by + (bh+text_h)//2), 
+                            self._font_face, self._font_scale, BUTTON_TEXT_COLOR, self._font_thickness, cv2.LINE_AA)
+            
+            info_texts = [
+                f"GUI FPS: {display_fps:.1f} | Node Loop Target: {target_loop_freq:.1f}Hz",
+                f"Managed Objects: {len(display_states_snapshot)}",
+                f"GPS Speed: {current_gps_speed:.2f}m/s" if current_gps_speed is not None else "GPS Speed: N/A",
+                f"GPS Track: {current_gps_track:.1f}deg" if current_gps_track is not None else "GPS Track: N/A",
+                f"Strategy: {active_strategy.replace('_',' ').title()}"
+            ]
+            for text_line in info_texts:
+                cv2.putText(canvas, text_line, (10, text_y_pos), self._font_face, self._font_scale, self._text_color, self._font_thickness)
+                text_y_pos += line_height
+
+            if not display_states_snapshot:
+                no_obj_display_text = "No objects managed/visible"
+                text_size_no_obj, _ = cv2.getTextSize(no_obj_display_text, self._font_face, self._font_scale*1.2, self._font_thickness)
+                text_w_no_obj, text_h_no_obj = text_size_no_obj
+                cv2.putText(canvas, no_obj_display_text, 
+                            ((self._gui_width - text_w_no_obj) // 2, (self._gui_height + text_h_no_obj) // 2), 
+                            self._font_face, self._font_scale*1.2, (0,165,255), self._font_thickness)
+
+            try:
+                cv2.imshow(self._window_name, canvas)
+                key = cv2.waitKey(self._wait_ms) & 0xFF
+                if key == 27 or key == ord('q'):
+                    self._logger.info("DebugGUI: Close requested via keypress.")
+                    self._shutdown_event.set()
+                if cv2.getWindowProperty(self._window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    self._logger.info("DebugGUI: Window closed by user (e.g., 'X' button).")
+                    self._shutdown_event.set()
+            except cv2.error as e:
+                if "NULL window" in str(e) or "Invalid window" in str(e) or "checkWindowIsValid" in str(e).lower():
+                     self._logger.warning(f"DebugGUI: OpenCV window became invalid or was closed externally. Loop terminating. Error: {e}")
+                else: self._logger.error(f"DebugGUI: OpenCV error during imshow/waitKey: {e}. Loop terminating.")
+                self._shutdown_event.set()
+            except Exception as e: 
+                self._logger.error(f"DebugGUI: Unexpected error in display/event handling: {e}. Loop terminating.", exc_info=True)
+                self._shutdown_event.set()
+
+            frame_count += 1
+            elapsed_time_for_fps_calc = current_mono_time - last_fps_calc_time_mono
+            if elapsed_time_for_fps_calc >= 1.0:
+                display_fps = frame_count / elapsed_time_for_fps_calc
+                frame_count = 0
+                last_fps_calc_time_mono = current_mono_time
+        
+        self._logger.info("DebugGUI loop finished.")
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/visualization/__init__.py`:
+
+```py
+from .debug_gui import DebugGui, OPENCV_AVAILABLE
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/common/geometry.py`:
+
+```py
+import logging
+from typing import Tuple
+from .definitions import CameraParams
+
+logger = logging.getLogger(__name__)
+
+# IMPORTANT: functions use following assumptions:
+#   1. The camera looks straight down (zero pitch/roll)
+#   2. The provided GSD is constant across the image
+#   3. The robot's ground frame origin (0,0) corresponds to the
+#      center of the image projected onto the ground
+
+def image_px_to_robot_ground_m(
+    pixel_coords: Tuple[float, float],
+    cam_params: CameraParams
+) -> Tuple[float, float]:
+    px_x, px_y = pixel_coords
+
+    px_rel_center_x = px_x - cam_params.center_x_px
+    px_rel_center_y = px_y - cam_params.center_y_px
+
+    ground_x_m = px_rel_center_x * cam_params.m_per_px
+    ground_y_m = px_rel_center_y * cam_params.m_per_px
+
+    return ground_x_m, ground_y_m
+
+def robot_ground_m_to_image_px(
+    ground_coords_m: Tuple[float, float],
+    cam_params: CameraParams
+) -> Tuple[float, float]:
+    ground_x_m, ground_y_m = ground_coords_m
+
+    px_rel_center_x = ground_x_m / cam_params.m_per_px
+    px_rel_center_y = ground_y_m / cam_params.m_per_px 
+
+    px_x = px_rel_center_x + cam_params.center_x_px
+    px_y = px_rel_center_y + cam_params.center_y_px
+
+    return px_x, px_y
+
+
+def estimate_object_size_m(
+    bbox_image_px: Tuple[float, float, float, float], # x,y,w,h
+    cam_params: CameraParams
+) -> Tuple[float, float]:
+    _, _, width_px, height_px = bbox_image_px
+    # Simple scaling using average GSD
+    width_m = width_px * cam_params.m_per_px
+    length_m = height_px * cam_params.m_per_px 
+    return width_m, length_m
+
+
+def calibration_px_to_robot_ground_m(
+    calib_pixel_coords: Tuple[int, int],
+    node_cam_params: CameraParams 
+) -> Tuple[float, float]:
+    return image_px_to_robot_ground_m(calib_pixel_coords, node_cam_params)
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/common/definitions.py`:
+
+```py
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, List
+from enum import Enum, auto
+import time
+import numpy as np
+
+from rclpy.time import Time
+
+class ObjectStatus(Enum):
+    """Represents the state of a potential spray object."""
+    PENDING = auto()        # Newly identified or re-evaluating strategy decision
+    TARGETED = auto()       # Strategy decided YES, pending planning/scheduling
+    IGNORED = auto()        # Strategy decided NO
+    SCHEDULED = auto()      # Spray timing/nozzles determined by scheduler
+    SPRAYING = auto()       # Actively being sprayed (within calculated window + latency effects)
+    SPRAYED = auto()        # Has passed through the spray window and duration
+    MISSED = auto()         # Passed through window but wasn't sprayed (e.g., error, disabled)
+    LOST = auto()           # Track lost by vision system before completion or spray
+    APPROACHING = auto()    # Optional: If planner wants to mark objects nearing boom
+
+
+@dataclass
+class Nozzle:
+    """
+    Represents single nozzle on the spray boom
+    Includes its physical position, its calibrated spray pattern
+    and its specific activation Y-coordinate for scheduling
+    """
+    index: int
+    position_m: Tuple[float, float] # Absolute position on the boom (X, Y) in robot frame
+    # Calibrated spray pattern polygon vertices, relative to position_m (meters)
+    spray_pattern_relative_m: List[Tuple[float, float]] = field(default_factory=list)
+    # Bounding box of the relative spray pattern (rel_min_x, rel_min_y, rel_max_x, rel_max_y)
+    bounding_box_relative_m: Optional[Tuple[float, float, float, float]] = field(default=None, init=False)
+    # Absolute Y-coordinate (robot ground frame) of this nozzle's activation line
+    # Derived from the center of its calibrated spray pattern
+    activation_y_m: Optional[float] = None
+
+    def __post_init__(self):
+        """Calculates the relative bounding box after initialization or pattern update"""
+        self.recalculate_bounding_box()
+
+    def recalculate_bounding_box(self):
+        """Helper to calculate the bounding box from the relative pattern"""
+        if self.spray_pattern_relative_m:
+            points = np.array(self.spray_pattern_relative_m)
+            if points.size > 0:
+                min_coords = np.min(points, axis=0)
+                max_coords = np.max(points, axis=0)
+                self.bounding_box_relative_m = (
+                    float(min_coords[0]), float(min_coords[1]),
+                    float(max_coords[0]), float(max_coords[1])
+                )
+            else:
+                self.bounding_box_relative_m = None
+        else:
+            self.bounding_box_relative_m = None
+
+@dataclass
+class CameraParams:
+    """Holds necessary camera parameters for coordinate transformations"""
+    width_px: int
+    height_px: int
+    gsd_px_per_m: float
+    m_per_px: float = field(init=False)
+    center_x_px: float = field(init=False)
+    center_y_px: float = field(init=False)
+
+    def __post_init__(self):
+        if self.gsd_px_per_m <= 0: raise ValueError("GSD must be positive")
+        self.m_per_px = 1.0 / self.gsd_px_per_m
+        self.center_x_px = self.width_px / 2.0
+        self.center_y_px = self.height_px / 2.0
+
+@dataclass
+class ManagedObject:
+    """Holds the state and information for an object being considered for spraying"""
+    track_id: int
+    class_id: int
+    class_name: str
+    last_seen_time: Time
+    bbox_image: Tuple[float, float, float, float] # Original x,y,w,h in pixels from vision
+    confidence: float
+    last_vision_class_name: str = ""
+    last_vision_confidence: float = 0.0
+    position_robot_m: Tuple[float, float] = (0.0, 0.0) # Absolute center (X, Y) based on bbox_image center
+    predicted_position_robot_m: Tuple[float, float] = (0.0, 0.0) # Continuously updated absolute center (X, Y)
+    size_m: Tuple[float, float] = (0.0, 0.0) # Original (width_m, length_m) based on bbox_image w,h
+    status: ObjectStatus = ObjectStatus.PENDING
+    assigned_nozzle_indices: List[int] = field(default_factory=list)
+    spray_start_time: Optional[Time] = None
+    spray_end_time: Optional[Time] = None
+    created_time: Time = field(default_factory=Time)
+    
+    bounding_box_m: Optional[Tuple[float, float, float, float]] = field(default=None, init=False)
+    activation_bounding_box_m: Optional[Tuple[float, float, float, float]] = field(default=None, init=False)
+    safety_bounding_box_m: Optional[Tuple[float, float, float, float]] = field(default=None, init=False)
+    current_safety_margin_m: float = 0.0
+
+
+    def update_bounding_boxes(self,
+                              cam_params: CameraParams,
+                              config_object_activation_width_px: Optional[float] = None,
+                              safety_margin_m: float = 0.0):
+        # 1. Update self.bounding_box_m (original object size at predicted position)
+        pred_x, pred_y = self.predicted_position_robot_m
+        width_m_orig, length_m_orig = self.size_m
+        
+        half_w_orig = width_m_orig / 2.0
+        half_l_orig = length_m_orig / 2.0
+        self.bounding_box_m = (
+            pred_x - half_w_orig, pred_y - half_l_orig,
+            pred_x + half_w_orig, pred_y + half_l_orig
+        )
+
+        # 2. Update self.activation_bounding_box_m (potentially shrunk width for activation)
+        original_pixel_width = self.bbox_image[2] 
+        activation_pixel_width = original_pixel_width
+
+        if config_object_activation_width_px is not None and \
+           0 < config_object_activation_width_px < original_pixel_width:
+            activation_pixel_width = config_object_activation_width_px
+        
+        activation_width_m = activation_pixel_width * cam_params.m_per_px
+        activation_length_m = length_m_orig 
+
+        half_act_w = activation_width_m / 2.0
+        half_act_l = activation_length_m / 2.0 
+
+        self.activation_bounding_box_m = (
+            pred_x - half_act_w, pred_y - half_act_l, 
+            pred_x + half_act_w, pred_y + half_act_l
+        )
+
+        # 3. Update self.safety_bounding_box_m
+        self.current_safety_margin_m = safety_margin_m
+        if safety_margin_m > 0.0001 and self.bounding_box_m:
+            orig_min_x, orig_min_y, orig_max_x, orig_max_y = self.bounding_box_m
+            self.safety_bounding_box_m = (
+                orig_min_x - safety_margin_m,
+                orig_min_y - safety_margin_m,
+                orig_max_x + safety_margin_m,
+                orig_max_y + safety_margin_m,
+            )
+        else:
+            self.safety_bounding_box_m = None
+
+
+@dataclass
+class DisplayObjectState:
+    """Data prepared by ObjectManager for the debuggui"""
+    track_id: int
+    predicted_center_image_px: Tuple[float, float]
+    original_bbox_dims_px: Tuple[float, float] # Original width, height in GUI scaled pixels
+    activation_bbox_dims_px: Tuple[float, float] # Activation width, height in GUI scaled pixels
+    label: str
+    status: ObjectStatus
+    safety_bbox_gui_px: Optional[Tuple[float, float, float, float]] = None # (min_x, min_y, max_x, max_y)
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/common/__init__.py`:
+
+```py
+from .definitions import ManagedObject, ObjectStatus, Nozzle, DisplayObjectState
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/hardware_interface/base_interface.py`:
+
+```py
+from abc import ABC, abstractmethod
+from typing import List
+
+class BaseHardwareInterface(ABC):
+    @abstractmethod
+    def set_nozzle_state(self, state: List[bool]): pass
+    @abstractmethod
+    def connect(self): pass
+    @abstractmethod
+    def disconnect(self): pass
+    @abstractmethod
+    def is_connected(self) -> bool: pass
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/hardware_interface/factory.py`:
+
+```py
+from typing import Dict, Any, Optional
+from .base_interface import BaseHardwareInterface
+from .serial_relay_driver import SerialRelayInterface
+
+def create_hardware_interface(interface_type: str, config: Dict[str, Any], logger) -> Optional[BaseHardwareInterface]:
+    logger.info(f"[HardwareFactory] Attempting to create interface: '{interface_type}'")
+    interface_type_lower = interface_type.lower() 
+
+    if interface_type_lower == "serial_relay":
+        serial_config = config.get('serial_relay', {})
+        if not serial_config:
+             logger.error("Hardware type is 'serial_relay' but no 'serial_relay' config section found.")
+             return None
+        try:
+            return SerialRelayInterface(serial_config, logger)
+        except Exception as e:
+            logger.fatal(f"Failed to initialize SerialRelayInterface: {e}")
+            return None
+    elif interface_type_lower == "dummy":
+        logger.info("Creating Dummy Hardware Interface (Not Implemented).")
+        return None
+    else:
+        logger.error(f"Unknown hardware interface type: '{interface_type}'")
+        return None
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/hardware_interface/serial_relay_driver.py`:
+
+```py
+import logging
+import time
+from typing import List, Optional, Dict, Any
+import serial 
+
+from .base_interface import BaseHardwareInterface
+
+class SerialRelayInterface(BaseHardwareInterface):
+    """
+    Hardware interface for controlling relays via serial commands.
+
+    Formats a boolean nozzle state list (up to 25 nozzles) and a forward
+    velocity (cm/s, 0-127) into the required 32-bit integer representation:
+    - Bits 31-25 (MSB 7 bits): Velocity in cm/s (0-127)
+    - Bits 24-0 (LSB 25 bits): Relay states (Bit 0 = Nozzle 0)
+    Sends this combined state over the serial port
+    """
+    COMMAND_PREFIX = ""
+    COMMAND_TERMINATOR = "\n"
+    EXPECTED_TOTAL_BITS = 32
+    EXPECTED_HEX_PAYLOAD_LENGTH = EXPECTED_TOTAL_BITS // 4 # 8 hex chars
+
+    NUM_VELOCITY_BITS = 7
+    NUM_RELAY_BITS = 25 
+    VELOCITY_SHIFT = NUM_RELAY_BITS # Shift velocity left by 25 bits
+
+    MAX_VELOCITY_PAYLOAD = (1 << NUM_VELOCITY_BITS) - 1 # 127
+    MAX_RELAY_STATE_INT = (1 << NUM_RELAY_BITS) - 1
+    MAX_SUPPORTED_NOZZLES = NUM_RELAY_BITS # Can control up to 25 nozzles
+
+    def __init__(self, config: Dict[str, Any], logger: logging.Logger):
+        self._logger = logger
+        self._port: Optional[str] = None
+        self._baudrate: int = 9600
+        self._num_hardware_bits: int = self.EXPECTED_TOTAL_BITS
+        self._serial_connection: Optional[serial.Serial] = None
+        self._last_sent_combined_state: Optional[int] = None # Cache last *combined* state
+
+        try:
+            self._port = config.get('port')
+            if not self._port:
+                raise ValueError("'port' not specified in serial_relay config.")
+            self._baudrate = int(config.get('baudrate', 9600))
+
+            self._logger.info(f"SerialRelayInterface configured for port {self._port} at {self._baudrate} baud.")
+            self._logger.info(f"  Hardware Command Format: {self.EXPECTED_TOTAL_BITS}-bit total")
+            self._logger.info(f"    Bits 31-{self.NUM_RELAY_BITS}: {self.NUM_VELOCITY_BITS}-bit Velocity (0-{self.MAX_VELOCITY_PAYLOAD} cm/s)")
+            self._logger.info(f"    Bits {self.NUM_RELAY_BITS-1}-0: {self.NUM_RELAY_BITS}-bit Relay States (Max {self.MAX_SUPPORTED_NOZZLES} relays)")
+
+        except (ValueError, TypeError, KeyError) as e:
+            self._logger.fatal(f"Invalid serial_relay configuration: {e}")
+            raise ValueError(f"SerialRelayInterface config error: {e}") from e
+
+    def connect(self) -> bool:
+        if self.is_connected():
+            self._logger.info("Serial port already connected.")
+            return True
+        if not self._port:
+            self._logger.error("Cannot connect: Serial port not configured.")
+            return False
+        try:
+            self._logger.info(f"Attempting serial connection to {self._port}...")
+            self._serial_connection = serial.Serial(
+                port=self._port,
+                baudrate=self._baudrate,
+                timeout=0.1, 
+                write_timeout=0.1
+            )
+            time.sleep(0.1) # let port settle
+            if self._serial_connection.is_open:
+                self._serial_connection.reset_input_buffer()
+                self._serial_connection.reset_output_buffer()
+                self._logger.info(f"Successfully connected to serial port {self._port}.")
+                self.send_combined_integer_state(0) # all off on connect
+                return True
+            else:
+                self._logger.error(f"Failed to open serial port {self._port} (is_open=False).")
+                self._serial_connection = None
+                return False
+        except serial.SerialException as e:
+            self._logger.error(f"Serial error connecting to {self._port}: {e}")
+            self._serial_connection = None
+            return False
+        except Exception as e:
+            self._logger.error(f"Unexpected error connecting to {self._port}: {e}")
+            self._serial_connection = None
+            return False
+
+    def disconnect(self):
+        if self._serial_connection and self._serial_connection.is_open:
+            try:
+                self.send_combined_integer_state(0) # all off on disconnect
+                time.sleep(0.05) 
+                self._logger.info(f"Disconnecting from serial port {self._port}...")
+                self._serial_connection.close()
+                self._logger.info("Serial port disconnected.")
+            except Exception as e:
+                self._logger.error(f"Error during serial disconnection: {e}")
+        self._serial_connection = None
+        self._last_sent_combined_state = None # clear cache on disconnect
+
+    def is_connected(self) -> bool:
+        return self._serial_connection is not None and self._serial_connection.is_open
+
+    def set_nozzle_state(self, state: List[bool], velocity_cmps: int):
+        if not self.is_connected():
+            self._logger.error("Cannot set nozzle state: Not connected.")
+            return
+
+        num_commanded_nozzles = len(state)
+
+        clamped_velocity = max(0, min(int(velocity_cmps), self.MAX_VELOCITY_PAYLOAD))
+        if clamped_velocity != velocity_cmps:
+             self._logger.warning(f"Input velocity {velocity_cmps} cm/s clamped to {clamped_velocity} for 7-bit payload.", throttle_duration_sec=5)
+
+        relay_state_int = 0
+        if num_commanded_nozzles > self.MAX_SUPPORTED_NOZZLES:
+             self._logger.warning(f"Commanded nozzle list length ({num_commanded_nozzles}) exceeds hardware limit ({self.MAX_SUPPORTED_NOZZLES}). Truncating.")
+             state = state[:self.MAX_SUPPORTED_NOZZLES] # Truncate the list
+
+        for i, is_on in enumerate(state):
+            if is_on:
+                relay_state_int |= (1 << i) # Set the i-th bit
+
+        combined_state_int = (clamped_velocity << self.VELOCITY_SHIFT) | relay_state_int
+
+        if combined_state_int == self._last_sent_combined_state:
+            # self._logger.debug("Combined state unchanged, skipping serial send.")
+            return
+
+        if self.send_combined_integer_state(combined_state_int):
+             self._last_sent_combined_state = combined_state_int 
+        else:
+             self._logger.error("Failed to send combined nozzle state command.")
+             self._last_sent_combined_state = None 
+        return combined_state_int
+
+    def _format_command(self, hex_payload: str) -> Optional[bytes]:
+        if len(hex_payload) != self.EXPECTED_HEX_PAYLOAD_LENGTH:
+            self._logger.error(f"Internal Error: Formatted hex payload length ({len(hex_payload)}) != expected ({self.EXPECTED_HEX_PAYLOAD_LENGTH}). Payload: '{hex_payload}'")
+            return None
+        if not all(c in '0123456789abcdefABCDEF' for c in hex_payload):
+             self._logger.error(f"Internal Error: Invalid characters in hex payload '{hex_payload}'.")
+             return None
+
+        command_str = f"{self.COMMAND_PREFIX}{hex_payload}{self.COMMAND_TERMINATOR}"
+        return command_str.encode('ascii')
+
+    def _send_raw_command(self, command_bytes: bytes) -> bool:
+        if not self.is_connected():
+            self._logger.error("Cannot send raw command: Not connected.")
+            return False
+        if not command_bytes:
+            self._logger.error("Cannot send empty raw command.")
+            return False
+
+        try:
+            bytes_written = self._serial_connection.write(command_bytes)
+            # self._logger.debug(f"Serial command sent: {command_bytes!r} ({bytes_written} bytes)")
+            return True
+        except serial.SerialTimeoutException:
+            self._logger.error("Serial write operation timed out.")
+            return False
+        except serial.SerialException as e:
+            self._logger.error(f"Serial communication error during send: {e}")
+            self.disconnect() # disconnect on error to force reconnect attempt later
+            return False
+        except Exception as e:
+            self._logger.error(f"Unexpected error during serial send: {e}")
+            return False
+
+    def send_combined_integer_state(self, combined_state_int: int) -> bool:
+        max_val = (1 << self._num_hardware_bits) - 1
+        if not (0 <= combined_state_int <= max_val):
+            # This check should ideally not fail if inputs to set_nozzle_state are correct
+            self._logger.error(f"Internal Error: Combined integer state {combined_state_int} out of range for {self._num_hardware_bits} bits (0-{max_val}).")
+            return False
+        try:
+            # format as hex, 0-padded to the expected length (8 chars for 32 bits)
+            hex_payload = f'{combined_state_int:0{self.EXPECTED_HEX_PAYLOAD_LENGTH}x}'
+            command_bytes = self._format_command(hex_payload)
+            if command_bytes is None:
+                return False
+            return self._send_raw_command(command_bytes)
+        except Exception as e:
+            self._logger.error(f"Error formatting combined integer state {combined_state_int}: {e}")
+            return False
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/sprayer_system/hardware_interface/__init__.py`:
+
+```py
+from .base_interface import BaseHardwareInterface
+from .factory import create_hardware_interface
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/nozzle_pruner/prune_nozzle_calibration.py`:
+
+```py
+import argparse
+import os
+import sys
+import datetime
+import logging
+from typing import List, Dict, Tuple, Optional, Any
+
+try:
+    import yaml
+    import numpy as np
+except ImportError as e:
+    print(f"ERROR: Missing dependency - {e}. Please install PyYAML and NumPy.")
+    print("pip install PyYAML numpy")
+    sys.exit(1)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+SCALE_FACTOR = 2
+
+class NozzleData:
+    def __init__(self, index: int, polygon_px: List[List[int]]):
+        self.index = index
+        self.original_polygon_px = polygon_px
+        self.min_x: float = float('inf')
+        self.max_x: float = float('-inf')
+        self.min_y: float = float('inf')
+        self.max_y: float = float('-inf')
+        self.center_x: Optional[float] = None
+        self.pruned_min_x: Optional[float] = None
+        self.pruned_max_x: Optional[float] = None
+        self._calculate_bounds_and_center()
+
+    def _calculate_bounds_and_center(self):
+        if not self.original_polygon_px:
+            logger.warning(f"Nozzle {self.index} has no polygon points.")
+            return
+
+        points = np.array(self.original_polygon_px, dtype=np.float32)
+        if points.shape[0] < 1 or points.shape[1] != 2:
+             logger.warning(f"Nozzle {self.index} has invalid polygon shape: {points.shape}")
+             return
+
+        self.min_x = float(np.min(points[:, 0]))
+        self.max_x = float(np.max(points[:, 0]))
+        self.min_y = float(np.min(points[:, 1]))
+        self.max_y = float(np.max(points[:, 1]))
+
+        if self.min_x <= self.max_x:
+            self.center_x = (self.min_x + self.max_x) / 2.0
+        else:
+             logger.warning(f"Nozzle {self.index} has min_x ({self.min_x}) > max_x ({self.max_x}).")
+
+
+def prune_nozzles(input_file: str, output_file: str):
+    logger.info(f"Loading nozzle calibration from: {input_file}")
+
+    try:
+        with open(input_file, 'r') as f:
+            calib_data = yaml.safe_load(f)
+    except FileNotFoundError:
+        logger.error(f"Input file not found: {input_file}")
+        sys.exit(1)
+    except yaml.YAMLError as e:
+        logger.error(f"Error parsing YAML file {input_file}: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Error reading input file {input_file}: {e}")
+        sys.exit(1)
+
+    if not isinstance(calib_data, dict) or 'nozzles' not in calib_data:
+        logger.error("Invalid YAML structure: Missing 'nozzles' key.")
+        sys.exit(1)
+
+    nozzles_raw = calib_data.get('nozzles', [])
+    nozzle_objects: List[NozzleData] = []
+    valid_indices = set()
+    for nozzle_dict in nozzles_raw:
+        if not isinstance(nozzle_dict, dict): continue
+        idx = nozzle_dict.get('index')
+        poly = nozzle_dict.get('spray_pattern_pixels')
+        if isinstance(idx, int) and idx >= 0 and isinstance(poly, list) and poly:
+            if idx in valid_indices:
+                 logger.warning(f"Duplicate index {idx} found. Skipping subsequent entry.")
+                 continue
+            try:
+                nozzle_obj = NozzleData(idx, poly)
+                if nozzle_obj.center_x is not None: 
+                    nozzle_objects.append(nozzle_obj)
+                    valid_indices.add(idx)
+                else:
+                     logger.warning(f"Skipping nozzle {idx} due to invalid polygon data.")
+            except Exception as e:
+                 logger.error(f"Error processing nozzle {idx} data: {e}")
+        else:
+            logger.warning(f"Skipping invalid nozzle entry: {nozzle_dict}")
+
+    if not nozzle_objects:
+        logger.error("No valid nozzle data found in the input file.")
+        sys.exit(1)
+
+    nozzle_objects.sort(key=lambda n: n.index)
+    nozzle_map: Dict[int, NozzleData] = {n.index: n for n in nozzle_objects}
+    sorted_indices = [n.index for n in nozzle_objects]
+    num_valid_nozzles = len(sorted_indices)
+    logger.info(f"Processed {num_valid_nozzles} valid nozzles. Indices: {sorted_indices}")
+
+    logger.info("Calculating pruned boundaries based on midpoints...")
+    for i, current_idx in enumerate(sorted_indices):
+        current_nozzle = nozzle_map[current_idx]
+
+        if i == 0: 
+            current_nozzle.pruned_min_x = current_nozzle.min_x
+            logger.debug(f"Nozzle {current_idx} (Leftmost): Using original min_x: {current_nozzle.pruned_min_x:.2f}")
+        else:
+            left_neighbor_idx = sorted_indices[i-1]
+            left_neighbor = nozzle_map[left_neighbor_idx]
+            if left_neighbor.center_x is not None and current_nozzle.center_x is not None:
+                 midpoint_x = (left_neighbor.center_x + current_nozzle.center_x) / 2.0
+                 current_nozzle.pruned_min_x = midpoint_x
+                 logger.debug(f"Nozzle {current_idx}: Left boundary (midpoint with {left_neighbor_idx}): {current_nozzle.pruned_min_x:.2f}")
+            else:
+                 logger.warning(f"Cannot calculate left boundary for {current_idx} due to missing center_x on neighbor {left_neighbor_idx}. Using original min_x.")
+                 current_nozzle.pruned_min_x = current_nozzle.min_x
+
+        if i == num_valid_nozzles - 1: 
+            current_nozzle.pruned_max_x = current_nozzle.max_x
+            logger.debug(f"Nozzle {current_idx} (Rightmost): Using original max_x: {current_nozzle.pruned_max_x:.2f}")
+        else:
+            right_neighbor_idx = sorted_indices[i+1]
+            right_neighbor = nozzle_map[right_neighbor_idx]
+            if right_neighbor.center_x is not None and current_nozzle.center_x is not None:
+                 midpoint_x = (current_nozzle.center_x + right_neighbor.center_x) / 2.0
+                 current_nozzle.pruned_max_x = midpoint_x
+                 logger.debug(f"Nozzle {current_idx}: Right boundary (midpoint with {right_neighbor_idx}): {current_nozzle.pruned_max_x:.2f}")
+            else:
+                 logger.warning(f"Cannot calculate right boundary for {current_idx} due to missing center_x on neighbor {right_neighbor_idx}. Using original max_x.")
+                 current_nozzle.pruned_max_x = current_nozzle.max_x
+
+        if current_nozzle.pruned_min_x is not None and current_nozzle.pruned_max_x is not None:
+             if current_nozzle.pruned_min_x >= current_nozzle.pruned_max_x:
+                  logger.warning(f"Nozzle {current_idx}: Pruned min_x ({current_nozzle.pruned_min_x:.2f}) >= pruned max_x ({current_nozzle.pruned_max_x:.2f}). Check nozzle spacing/overlap.")
+
+    output_data: Dict[str, Any] = {
+        'calibration_details': calib_data.get('calibration_details', {}), 
+        'nozzles': []
+    }
+    output_data['calibration_details']['pruning_timestamp'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    output_data['calibration_details']['pruning_input_file'] = os.path.basename(input_file)
+
+    num_pruned = 0
+    for nozzle_idx in sorted_indices: 
+        nozzle = nozzle_map[nozzle_idx]
+        if nozzle.pruned_min_x is not None and nozzle.pruned_max_x is not None:
+            pruned_poly_px = [
+                [nozzle.pruned_min_x*SCALE_FACTOR, nozzle.min_y*SCALE_FACTOR], # Top-left
+                [nozzle.pruned_max_x*SCALE_FACTOR, nozzle.min_y*SCALE_FACTOR], # Top-right
+                [nozzle.pruned_max_x*SCALE_FACTOR, nozzle.max_y*SCALE_FACTOR], # Bottom-right
+                [nozzle.pruned_min_x*SCALE_FACTOR, nozzle.max_y*SCALE_FACTOR], # Bottom-left
+            ]
+            output_data['nozzles'].append({
+                'index': nozzle.index,
+                'spray_pattern_pixels': pruned_poly_px 
+            })
+            num_pruned += 1
+        else:
+            logger.warning(f"Skipping nozzle {nozzle_idx} in output due to failed pruning calculation.")
+
+    try:
+        output_dir = os.path.dirname(output_file)
+        if output_dir: 
+            os.makedirs(output_dir, exist_ok=True)
+
+        with open(output_file, 'w') as f:
+            yaml.dump(output_data, f, indent=2, sort_keys=False, default_flow_style=None)
+        logger.info(f"Successfully saved pruned calibration data for {num_pruned} nozzles to: {output_file}")
+
+    except Exception as e:
+        logger.error(f"Failed to save pruned calibration data to {output_file}: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Prune nozzle calibration polygons to remove overlap.")
+    parser.add_argument(
+        "input_file",
+        help="Path to the input nozzle_calibration.yaml file."
+    )
+    parser.add_argument(
+        "-o", "--output-file",
+        default="pruned_nozzle_calibration.yaml",
+        help="Path to save the pruned calibration YAML file (default: pruned_nozzle_calibration.yaml)."
+    )
+
+    args = parser.parse_args()
+
+    prune_nozzles(args.input_file, args.output_file)
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/nozzle_pruner/nozzle_calibration.yaml`:
+
+```yaml
+calibration_details:
+  image_width_px: 1232
+  image_height_px: 1072
+  timestamp: '2025-04-29 16:32:13'
+  threshold_value: 50
+  poly_approx_epsilon: 0.01
+  min_contour_area: 10.0
+nozzles:
+- index: 0
+  spray_pattern_pixels:
+  - - 88
+    - 962
+  - - 120
+    - 963
+  - - 153
+    - 984
+  - - 165
+    - 978
+  - - 174
+    - 954
+  - - 201
+    - 944
+  - - 205
+    - 928
+  - - 214
+    - 938
+  - - 222
+    - 929
+  - - 202
+    - 907
+  - - 200
+    - 924
+  - - 167
+    - 922
+  - - 140
+    - 901
+  - - 120
+    - 914
+  - - 115
+    - 936
+- index: 1
+  spray_pattern_pixels:
+  - - 130
+    - 900
+  - - 130
+    - 950
+  - - 200
+    - 950
+  - - 200
+    - 900
+- index: 2
+  spray_pattern_pixels:
+  - - 170
+    - 900
+  - - 170
+    - 950
+  - - 230
+    - 950
+  - - 230
+    - 900
+- index: 3
+  spray_pattern_pixels:
+  - - 204
+    - 926
+  - - 240
+    - 949
+  - - 252
+    - 951
+  - - 263
+    - 947
+  - - 272
+    - 932
+  - - 298
+    - 919
+  - - 305
+    - 909
+  - - 293
+    - 895
+  - - 267
+    - 896
+  - - 261
+    - 882
+  - - 239
+    - 880
+  - - 211
+    - 904
+  - - 213
+    - 913
+- index: 4
+  spray_pattern_pixels:
+  - - 246
+    - 931
+  - - 286
+    - 934
+  - - 311
+    - 952
+  - - 329
+    - 922
+  - - 373
+    - 901
+  - - 367
+    - 894
+  - - 322
+    - 893
+  - - 308
+    - 881
+  - - 314
+    - 880
+  - - 298
+    - 875
+  - - 298
+    - 882
+  - - 281
+    - 883
+  - - 256
+    - 912
+  - - 273
+    - 907
+- index: 5
+  spray_pattern_pixels:
+  - - 338
+    - 873
+  - - 347
+    - 889
+  - - 319
+    - 893
+  - - 316
+    - 907
+  - - 290
+    - 934
+  - - 320
+    - 943
+  - - 338
+    - 958
+  - - 360
+    - 947
+  - - 366
+    - 961
+  - - 364
+    - 939
+  - - 374
+    - 935
+  - - 367
+    - 931
+  - - 394
+    - 913
+- index: 6
+  spray_pattern_pixels:
+  - - 324
+    - 932
+  - - 331
+    - 940
+  - - 353
+    - 942
+  - - 382
+    - 958
+  - - 404
+    - 950
+  - - 431
+    - 919
+  - - 423
+    - 904
+  - - 411
+    - 905
+  - - 353
+    - 884
+  - - 358
+    - 890
+  - - 352
+    - 886
+  - - 344
+    - 893
+  - - 349
+    - 901
+  - - 342
+    - 904
+  - - 343
+    - 920
+- index: 7
+  spray_pattern_pixels:
+  - - 430
+    - 871
+  - - 407
+    - 896
+  - - 406
+    - 906
+  - - 414
+    - 908
+  - - 400
+    - 916
+  - - 407
+    - 924
+  - - 379
+    - 943
+  - - 389
+    - 951
+  - - 417
+    - 947
+  - - 416
+    - 956
+  - - 425
+    - 953
+  - - 425
+    - 961
+  - - 442
+    - 967
+  - - 454
+    - 962
+  - - 459
+    - 939
+  - - 496
+    - 915
+  - - 491
+    - 906
+  - - 460
+    - 902
+  - - 452
+    - 893
+  - - 446
+    - 898
+  - - 451
+    - 887
+  - - 435
+    - 886
+- index: 8
+  spray_pattern_pixels:
+  - - 543
+    - 914
+  - - 522
+    - 908
+  - - 517
+    - 898
+  - - 493
+    - 905
+  - - 474
+    - 891
+  - - 441
+    - 929
+  - - 424
+    - 932
+  - - 421
+    - 953
+  - - 461
+    - 950
+  - - 466
+    - 959
+  - - 490
+    - 967
+  - - 505
+    - 940
+  - - 540
+    - 924
+- index: 9
+  spray_pattern_pixels:
+  - - 585
+    - 898
+  - - 547
+    - 898
+  - - 535
+    - 887
+  - - 546
+    - 885
+  - - 516
+    - 878
+  - - 493
+    - 898
+  - - 492
+    - 911
+  - - 469
+    - 930
+  - - 470
+    - 937
+  - - 499
+    - 939
+  - - 520
+    - 959
+  - - 539
+    - 950
+  - - 549
+    - 927
+  - - 584
+    - 911
+- index: 10
+  spray_pattern_pixels:
+  - - 628
+    - 894
+  - - 615
+    - 882
+  - - 600
+    - 886
+  - - 587
+    - 880
+  - - 589
+    - 875
+  - - 563
+    - 869
+  - - 565
+    - 862
+  - - 550
+    - 872
+  - - 541
+    - 867
+  - - 504
+    - 930
+  - - 515
+    - 936
+  - - 540
+    - 933
+  - - 551
+    - 945
+  - - 573
+    - 949
+  - - 601
+    - 915
+  - - 625
+    - 910
+- index: 11
+  spray_pattern_pixels:
+  - - 555
+    - 917
+  - - 587
+    - 917
+  - - 617
+    - 937
+  - - 622
+    - 928
+  - - 630
+    - 932
+  - - 639
+    - 907
+  - - 643
+    - 912
+  - - 668
+    - 894
+  - - 675
+    - 881
+  - - 627
+    - 874
+  - - 595
+    - 859
+  - - 599
+    - 865
+  - - 579
+    - 893
+  - - 573
+    - 889
+- index: 12
+  spray_pattern_pixels:
+  - - 596
+    - 915
+  - - 623
+    - 932
+  - - 622
+    - 924
+  - - 631
+    - 922
+  - - 638
+    - 931
+  - - 665
+    - 935
+  - - 680
+    - 930
+  - - 683
+    - 911
+  - - 722
+    - 899
+  - - 727
+    - 888
+  - - 714
+    - 877
+  - - 673
+    - 882
+  - - 636
+    - 864
+  - - 618
+    - 880
+  - - 628
+    - 883
+  - - 622
+    - 891
+  - - 615
+    - 888
+  - - 619
+    - 900
+  - - 606
+    - 902
+- index: 13
+  spray_pattern_pixels:
+  - - 642
+    - 939
+  - - 660
+    - 953
+  - - 671
+    - 952
+  - - 670
+    - 961
+  - - 680
+    - 960
+  - - 682
+    - 968
+  - - 691
+    - 963
+  - - 699
+    - 969
+  - - 715
+    - 962
+  - - 717
+    - 950
+  - - 758
+    - 927
+  - - 763
+    - 913
+  - - 725
+    - 904
+  - - 718
+    - 908
+  - - 703
+    - 894
+  - - 683
+    - 893
+  - - 670
+    - 917
+  - - 647
+    - 928
+- index: 14
+  spray_pattern_pixels:
+  - - 723
+    - 865
+  - - 700
+    - 896
+  - - 674
+    - 910
+  - - 667
+    - 923
+  - - 673
+    - 933
+  - - 708
+    - 934
+  - - 723
+    - 948
+  - - 743
+    - 950
+  - - 756
+    - 941
+  - - 761
+    - 926
+  - - 776
+    - 921
+  - - 791
+    - 894
+  - - 770
+    - 877
+  - - 758
+    - 880
+  - - 741
+    - 868
+- index: 15
+  spray_pattern_pixels:
+  - - 828
+    - 911
+  - - 821
+    - 903
+  - - 801
+    - 902
+  - - 797
+    - 888
+  - - 768
+    - 884
+  - - 759
+    - 889
+  - - 766
+    - 891
+  - - 759
+    - 893
+  - - 749
+    - 917
+  - - 719
+    - 937
+  - - 724
+    - 945
+  - - 763
+    - 951
+  - - 754
+    - 946
+  - - 761
+    - 944
+  - - 791
+    - 959
+  - - 805
+    - 944
+  - - 807
+    - 929
+- index: 16
+  spray_pattern_pixels:
+  - - 767
+    - 923
+  - - 779
+    - 930
+  - - 809
+    - 926
+  - - 819
+    - 935
+  - - 813
+    - 938
+  - - 837
+    - 939
+  - - 855
+    - 912
+  - - 885
+    - 903
+  - - 897
+    - 881
+  - - 854
+    - 878
+  - - 849
+    - 883
+  - - 830
+    - 870
+  - - 814
+    - 870
+  - - 800
+    - 898
+  - - 776
+    - 910
+- index: 17
+  spray_pattern_pixels:
+  - - 928
+    - 870
+  - - 904
+    - 866
+  - - 887
+    - 874
+  - - 871
+    - 860
+  - - 850
+    - 863
+  - - 841
+    - 876
+  - - 843
+    - 885
+  - - 819
+    - 917
+  - - 826
+    - 926
+  - - 844
+    - 923
+  - - 875
+    - 939
+  - - 895
+    - 924
+  - - 896
+    - 912
+  - - 931
+    - 893
+- index: 18
+  spray_pattern_pixels:
+  - - 980
+    - 889
+  - - 966
+    - 881
+  - - 952
+    - 882
+  - - 946
+    - 875
+  - - 905
+    - 870
+  - - 888
+    - 879
+  - - 888
+    - 899
+  - - 866
+    - 922
+  - - 898
+    - 928
+  - - 919
+    - 945
+  - - 935
+    - 935
+  - - 945
+    - 911
+  - - 979
+    - 899
+- index: 19
+  spray_pattern_pixels:
+  - - 1013
+    - 906
+  - - 1001
+    - 895
+  - - 984
+    - 897
+  - - 966
+    - 886
+  - - 965
+    - 873
+  - - 931
+    - 901
+  - - 921
+    - 920
+  - - 903
+    - 929
+  - - 899
+    - 940
+  - - 937
+    - 947
+  - - 927
+    - 955
+  - - 970
+    - 958
+  - - 997
+    - 943
+  - - 986
+    - 935
+  - - 1012
+    - 914
+- index: 20
+  spray_pattern_pixels:
+  - - 1055
+    - 894
+  - - 1042
+    - 887
+  - - 1019
+    - 891
+  - - 998
+    - 875
+  - - 984
+    - 875
+  - - 969
+    - 884
+  - - 972
+    - 896
+  - - 961
+    - 906
+  - - 933
+    - 917
+  - - 929
+    - 932
+  - - 957
+    - 941
+  - - 965
+    - 934
+  - - 967
+    - 940
+  - - 976
+    - 937
+  - - 986
+    - 946
+  - - 1001
+    - 947
+- index: 21
+  spray_pattern_pixels:
+  - - 1038
+    - 847
+  - - 1011
+    - 865
+  - - 1003
+    - 887
+  - - 998
+    - 888
+  - - 999
+    - 872
+  - - 995
+    - 889
+  - - 979
+    - 908
+  - - 988
+    - 922
+  - - 1019
+    - 923
+  - - 1028
+    - 933
+  - - 1053
+    - 937
+  - - 1096
+    - 881
+- index: 22
+  spray_pattern_pixels:
+  - - 1137
+    - 898
+  - - 1129
+    - 890
+  - - 1107
+    - 889
+  - - 1090
+    - 875
+  - - 1076
+    - 882
+  - - 1078
+    - 872
+  - - 1040
+    - 911
+  - - 1032
+    - 911
+  - - 1021
+    - 930
+  - - 1033
+    - 939
+  - - 1054
+    - 938
+  - - 1079
+    - 950
+  - - 1100
+    - 947
+- index: 23
+  spray_pattern_pixels:
+  - - 1183
+    - 903
+  - - 1124
+    - 882
+  - - 1113
+    - 885
+  - - 1099
+    - 907
+  - - 1056
+    - 937
+  - - 1061
+    - 941
+  - - 1056
+    - 941
+  - - 1060
+    - 947
+  - - 1093
+    - 940
+  - - 1113
+    - 952
+  - - 1141
+    - 950
+  - - 1154
+    - 926
+  - - 1170
+    - 921
+- index: 24
+  spray_pattern_pixels:
+  - - 1231
+    - 890
+  - - 1196
+    - 890
+  - - 1192
+    - 879
+  - - 1181
+    - 873
+  - - 1161
+    - 874
+  - - 1165
+    - 877
+  - - 1151
+    - 881
+  - - 1147
+    - 895
+  - - 1134
+    - 896
+  - - 1135
+    - 903
+  - - 1119
+    - 922
+  - - 1130
+    - 930
+  - - 1153
+    - 927
+  - - 1171
+    - 941
+  - - 1185
+    - 942
+  - - 1200
+    - 920
+  - - 1231
+    - 908
+
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/setup.cfg`:
+
+```cfg
+[develop]
+script_dir=$base/lib/sprayer_system
+[install]
+install_scripts=$base/lib/sprayer_system
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/package.xml`:
+
+```xml
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>sprayer_system</name>
+  <version>0.1.0</version>
+  <description>ROS 2 node for controlling precision spraying based on vision system input.</description>
+  <maintainer email="msn@agro.au.dk">Michael Noerbo</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend> 
+  <depend>vision_interfaces</depend> 
+  <depend>gps_msgs</depend>      
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/config/sprayer_config.yaml`:
+
+```yaml
+sprayer_control_node:
+  ros__parameters:
+
+    # === ROS Communication ===
+    input_topic: "/vision_system/tracked_objects"
+    gps_topic: "/gpsfix"
+    control_loop_frequency: 128.0
+
+    # === Node Behavior ===
+    log_received_messages: false
+
+    # === Camera Parameters ===
+    camera_parameters:
+      image_width_px: 2464
+      image_height_px: 2144 #1408
+      #gsd_px_per_meter: 2898.8 # 2464px / (850mm / 1000 mm/m)
+      gsd_px_per_meter: 2209.86 # 2464px / (1115mm / 1000 mm/m) (img_width measured to 111.5cm in test-setup)
+
+    # === Motion Model ===
+    motion_model:
+      playback_speed_factor: 1.0
+      # --- GPS Fallback Configuration ---
+      gps_staleness_threshold_sec: 1.0 # Max time (s) since last GPS msg before considered stale - set <= 0 to disable check
+
+    # === Spraying Strategy ===
+    strategy:
+      type: "simple_weed" # Default strategy
+      simple_weed:
+        crop_class_names: ["PIBSA", "BEAVA", "ZEAMX", "SOLTU"]
+        min_confidence: 0.0
+        min_target_coverage_ratio: 1.0 # NOT IMPLEMENTED CURRENTLY
+        max_nontarget_overspray_ratio: 1.0 # NOT IMPLEMENTED CURRENTLY
+        safety_zone_in_cm: 3.0 # 5cm safety zone for crop_class_names
+      spray_all:
+        crop_class_names: []
+        min_confidence: 0.0
+        min_target_coverage_ratio: 1.0 # NOT IMPLEMENTED CURRENTLY
+        max_nontarget_overspray_ratio: 1.0 # NOT IMPLEMENTED CURRENTLY
+        safety_zone_in_cm: 0.0 # 5cm safety zone for crop_class_names
+
+    # === Nozzle Layout ===
+    nozzle_layout:
+      num_nozzles: 25
+      calibration_file: "/home/orei/orei-cam_ws/src/sprayer_system/config/pruned_nozzle_calibration_small.yaml"
+      activation_zone_target_width_px: -1.0  # Example: 20.0 to target a 20px width
+      activation_zone_target_height_px: 1.0 #20.0 # Example: 50.0 to target a 50px height
+
+    # === Timing (Placeholder - For Planning Stage) ===
+    timing:
+      nozzle_actuation_latency: 0.250 # in s (0.008=8ms)
+      spray_margin_time: 0.00         # Seconds, like padding the bounding box with additional before/after spray
+ 
+    # === Object Management === 
+    object_management:
+      keep_lost_objects_on_screen: false
+      activation_zone_object_width_px: 5.0
+        
+    # === Hardware Interface ===
+    hardware_interface:
+      type: "serial_relay" # "serial_relay" or "dummy"
+      serial_relay:
+        port: "/dev/ttyNC0" # UPDATE THIS 
+        baudrate: 9600
+        total_relays: 32     # Total bits the microcontroller expects
+
+    # === Debugging ===
+    debug:
+      enable_gui: true
+      gui_update_rate: 128.0 # does not have to match main loop freq, could be 24/30/60 etc
+      gui_window_name: "Sprayer Debug"
+      gui_width: 1232                  # Width for the top image view 
+      gui_height: 1067 #704            # Height for the top image view panel
+      
+      # object Visualization 
+      gui_object_fill_opacity: 0.4      # Opacity for general status fill
+      gui_spray_fill_opacity: 0.6       # Opacity for object fill when SPRAYING
+
+      # common gui params
+      gui_text_color: [255, 255, 255]
+      gui_font_scale: 0.5
+      gui_font_thickness: 1
+
+      # ------- spray history stuff - NOT YET IMPLEMENTED ---------
+      gui_spray_history_length: 500     # Max number of spray events to store/draw
+      gui_spray_color: [200, 150, 0]    # Spray color (BGR)
+      gui_spray_history_opacity: 0.6    # Opacity for ground spray history (0.0-1.0)
+
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/config/nozzle_calibration.yaml`:
+
+```yaml
+calibration_details:
+  image_width_px: 1232
+  image_height_px: 1072
+  timestamp: '2025-04-29 16:32:13'
+  threshold_value: 50
+  poly_approx_epsilon: 0.01
+  min_contour_area: 10.0
+nozzles:
+- index: 0
+  spray_pattern_pixels:
+  - - 88
+    - 962
+  - - 120
+    - 963
+  - - 153
+    - 984
+  - - 165
+    - 978
+  - - 174
+    - 954
+  - - 201
+    - 944
+  - - 205
+    - 928
+  - - 214
+    - 938
+  - - 222
+    - 929
+  - - 202
+    - 907
+  - - 200
+    - 924
+  - - 167
+    - 922
+  - - 140
+    - 901
+  - - 120
+    - 914
+  - - 115
+    - 936
+- index: 1
+  spray_pattern_pixels:
+  - - 130
+    - 900
+  - - 130
+    - 950
+  - - 200
+    - 950
+  - - 200
+    - 900
+- index: 2
+  spray_pattern_pixels:
+  - - 170
+    - 900
+  - - 170
+    - 950
+  - - 230
+    - 950
+  - - 230
+    - 900
+- index: 3
+  spray_pattern_pixels:
+  - - 204
+    - 926
+  - - 240
+    - 949
+  - - 252
+    - 951
+  - - 263
+    - 947
+  - - 272
+    - 932
+  - - 298
+    - 919
+  - - 305
+    - 909
+  - - 293
+    - 895
+  - - 267
+    - 896
+  - - 261
+    - 882
+  - - 239
+    - 880
+  - - 211
+    - 904
+  - - 213
+    - 913
+- index: 4
+  spray_pattern_pixels:
+  - - 246
+    - 931
+  - - 286
+    - 934
+  - - 311
+    - 952
+  - - 329
+    - 922
+  - - 373
+    - 901
+  - - 367
+    - 894
+  - - 322
+    - 893
+  - - 308
+    - 881
+  - - 314
+    - 880
+  - - 298
+    - 875
+  - - 298
+    - 882
+  - - 281
+    - 883
+  - - 256
+    - 912
+  - - 273
+    - 907
+- index: 5
+  spray_pattern_pixels:
+  - - 338
+    - 873
+  - - 347
+    - 889
+  - - 319
+    - 893
+  - - 316
+    - 907
+  - - 290
+    - 934
+  - - 320
+    - 943
+  - - 338
+    - 958
+  - - 360
+    - 947
+  - - 366
+    - 961
+  - - 364
+    - 939
+  - - 374
+    - 935
+  - - 367
+    - 931
+  - - 394
+    - 913
+- index: 6
+  spray_pattern_pixels:
+  - - 324
+    - 932
+  - - 331
+    - 940
+  - - 353
+    - 942
+  - - 382
+    - 958
+  - - 404
+    - 950
+  - - 431
+    - 919
+  - - 423
+    - 904
+  - - 411
+    - 905
+  - - 353
+    - 884
+  - - 358
+    - 890
+  - - 352
+    - 886
+  - - 344
+    - 893
+  - - 349
+    - 901
+  - - 342
+    - 904
+  - - 343
+    - 920
+- index: 7
+  spray_pattern_pixels:
+  - - 430
+    - 871
+  - - 407
+    - 896
+  - - 406
+    - 906
+  - - 414
+    - 908
+  - - 400
+    - 916
+  - - 407
+    - 924
+  - - 379
+    - 943
+  - - 389
+    - 951
+  - - 417
+    - 947
+  - - 416
+    - 956
+  - - 425
+    - 953
+  - - 425
+    - 961
+  - - 442
+    - 967
+  - - 454
+    - 962
+  - - 459
+    - 939
+  - - 496
+    - 915
+  - - 491
+    - 906
+  - - 460
+    - 902
+  - - 452
+    - 893
+  - - 446
+    - 898
+  - - 451
+    - 887
+  - - 435
+    - 886
+- index: 8
+  spray_pattern_pixels:
+  - - 543
+    - 914
+  - - 522
+    - 908
+  - - 517
+    - 898
+  - - 493
+    - 905
+  - - 474
+    - 891
+  - - 441
+    - 929
+  - - 424
+    - 932
+  - - 421
+    - 953
+  - - 461
+    - 950
+  - - 466
+    - 959
+  - - 490
+    - 967
+  - - 505
+    - 940
+  - - 540
+    - 924
+- index: 9
+  spray_pattern_pixels:
+  - - 585
+    - 898
+  - - 547
+    - 898
+  - - 535
+    - 887
+  - - 546
+    - 885
+  - - 516
+    - 878
+  - - 493
+    - 898
+  - - 492
+    - 911
+  - - 469
+    - 930
+  - - 470
+    - 937
+  - - 499
+    - 939
+  - - 520
+    - 959
+  - - 539
+    - 950
+  - - 549
+    - 927
+  - - 584
+    - 911
+- index: 10
+  spray_pattern_pixels:
+  - - 628
+    - 894
+  - - 615
+    - 882
+  - - 600
+    - 886
+  - - 587
+    - 880
+  - - 589
+    - 875
+  - - 563
+    - 869
+  - - 565
+    - 862
+  - - 550
+    - 872
+  - - 541
+    - 867
+  - - 504
+    - 930
+  - - 515
+    - 936
+  - - 540
+    - 933
+  - - 551
+    - 945
+  - - 573
+    - 949
+  - - 601
+    - 915
+  - - 625
+    - 910
+- index: 11
+  spray_pattern_pixels:
+  - - 555
+    - 917
+  - - 587
+    - 917
+  - - 617
+    - 937
+  - - 622
+    - 928
+  - - 630
+    - 932
+  - - 639
+    - 907
+  - - 643
+    - 912
+  - - 668
+    - 894
+  - - 675
+    - 881
+  - - 627
+    - 874
+  - - 595
+    - 859
+  - - 599
+    - 865
+  - - 579
+    - 893
+  - - 573
+    - 889
+- index: 12
+  spray_pattern_pixels:
+  - - 596
+    - 915
+  - - 623
+    - 932
+  - - 622
+    - 924
+  - - 631
+    - 922
+  - - 638
+    - 931
+  - - 665
+    - 935
+  - - 680
+    - 930
+  - - 683
+    - 911
+  - - 722
+    - 899
+  - - 727
+    - 888
+  - - 714
+    - 877
+  - - 673
+    - 882
+  - - 636
+    - 864
+  - - 618
+    - 880
+  - - 628
+    - 883
+  - - 622
+    - 891
+  - - 615
+    - 888
+  - - 619
+    - 900
+  - - 606
+    - 902
+- index: 13
+  spray_pattern_pixels:
+  - - 642
+    - 939
+  - - 660
+    - 953
+  - - 671
+    - 952
+  - - 670
+    - 961
+  - - 680
+    - 960
+  - - 682
+    - 968
+  - - 691
+    - 963
+  - - 699
+    - 969
+  - - 715
+    - 962
+  - - 717
+    - 950
+  - - 758
+    - 927
+  - - 763
+    - 913
+  - - 725
+    - 904
+  - - 718
+    - 908
+  - - 703
+    - 894
+  - - 683
+    - 893
+  - - 670
+    - 917
+  - - 647
+    - 928
+- index: 14
+  spray_pattern_pixels:
+  - - 723
+    - 865
+  - - 700
+    - 896
+  - - 674
+    - 910
+  - - 667
+    - 923
+  - - 673
+    - 933
+  - - 708
+    - 934
+  - - 723
+    - 948
+  - - 743
+    - 950
+  - - 756
+    - 941
+  - - 761
+    - 926
+  - - 776
+    - 921
+  - - 791
+    - 894
+  - - 770
+    - 877
+  - - 758
+    - 880
+  - - 741
+    - 868
+- index: 15
+  spray_pattern_pixels:
+  - - 828
+    - 911
+  - - 821
+    - 903
+  - - 801
+    - 902
+  - - 797
+    - 888
+  - - 768
+    - 884
+  - - 759
+    - 889
+  - - 766
+    - 891
+  - - 759
+    - 893
+  - - 749
+    - 917
+  - - 719
+    - 937
+  - - 724
+    - 945
+  - - 763
+    - 951
+  - - 754
+    - 946
+  - - 761
+    - 944
+  - - 791
+    - 959
+  - - 805
+    - 944
+  - - 807
+    - 929
+- index: 16
+  spray_pattern_pixels:
+  - - 767
+    - 923
+  - - 779
+    - 930
+  - - 809
+    - 926
+  - - 819
+    - 935
+  - - 813
+    - 938
+  - - 837
+    - 939
+  - - 855
+    - 912
+  - - 885
+    - 903
+  - - 897
+    - 881
+  - - 854
+    - 878
+  - - 849
+    - 883
+  - - 830
+    - 870
+  - - 814
+    - 870
+  - - 800
+    - 898
+  - - 776
+    - 910
+- index: 17
+  spray_pattern_pixels:
+  - - 928
+    - 870
+  - - 904
+    - 866
+  - - 887
+    - 874
+  - - 871
+    - 860
+  - - 850
+    - 863
+  - - 841
+    - 876
+  - - 843
+    - 885
+  - - 819
+    - 917
+  - - 826
+    - 926
+  - - 844
+    - 923
+  - - 875
+    - 939
+  - - 895
+    - 924
+  - - 896
+    - 912
+  - - 931
+    - 893
+- index: 18
+  spray_pattern_pixels:
+  - - 980
+    - 889
+  - - 966
+    - 881
+  - - 952
+    - 882
+  - - 946
+    - 875
+  - - 905
+    - 870
+  - - 888
+    - 879
+  - - 888
+    - 899
+  - - 866
+    - 922
+  - - 898
+    - 928
+  - - 919
+    - 945
+  - - 935
+    - 935
+  - - 945
+    - 911
+  - - 979
+    - 899
+- index: 19
+  spray_pattern_pixels:
+  - - 1013
+    - 906
+  - - 1001
+    - 895
+  - - 984
+    - 897
+  - - 966
+    - 886
+  - - 965
+    - 873
+  - - 931
+    - 901
+  - - 921
+    - 920
+  - - 903
+    - 929
+  - - 899
+    - 940
+  - - 937
+    - 947
+  - - 927
+    - 955
+  - - 970
+    - 958
+  - - 997
+    - 943
+  - - 986
+    - 935
+  - - 1012
+    - 914
+- index: 20
+  spray_pattern_pixels:
+  - - 1055
+    - 894
+  - - 1042
+    - 887
+  - - 1019
+    - 891
+  - - 998
+    - 875
+  - - 984
+    - 875
+  - - 969
+    - 884
+  - - 972
+    - 896
+  - - 961
+    - 906
+  - - 933
+    - 917
+  - - 929
+    - 932
+  - - 957
+    - 941
+  - - 965
+    - 934
+  - - 967
+    - 940
+  - - 976
+    - 937
+  - - 986
+    - 946
+  - - 1001
+    - 947
+- index: 21
+  spray_pattern_pixels:
+  - - 1038
+    - 847
+  - - 1011
+    - 865
+  - - 1003
+    - 887
+  - - 998
+    - 888
+  - - 999
+    - 872
+  - - 995
+    - 889
+  - - 979
+    - 908
+  - - 988
+    - 922
+  - - 1019
+    - 923
+  - - 1028
+    - 933
+  - - 1053
+    - 937
+  - - 1096
+    - 881
+- index: 22
+  spray_pattern_pixels:
+  - - 1137
+    - 898
+  - - 1129
+    - 890
+  - - 1107
+    - 889
+  - - 1090
+    - 875
+  - - 1076
+    - 882
+  - - 1078
+    - 872
+  - - 1040
+    - 911
+  - - 1032
+    - 911
+  - - 1021
+    - 930
+  - - 1033
+    - 939
+  - - 1054
+    - 938
+  - - 1079
+    - 950
+  - - 1100
+    - 947
+- index: 23
+  spray_pattern_pixels:
+  - - 1183
+    - 903
+  - - 1124
+    - 882
+  - - 1113
+    - 885
+  - - 1099
+    - 907
+  - - 1056
+    - 937
+  - - 1061
+    - 941
+  - - 1056
+    - 941
+  - - 1060
+    - 947
+  - - 1093
+    - 940
+  - - 1113
+    - 952
+  - - 1141
+    - 950
+  - - 1154
+    - 926
+  - - 1170
+    - 921
+- index: 24
+  spray_pattern_pixels:
+  - - 1231
+    - 890
+  - - 1196
+    - 890
+  - - 1192
+    - 879
+  - - 1181
+    - 873
+  - - 1161
+    - 874
+  - - 1165
+    - 877
+  - - 1151
+    - 881
+  - - 1147
+    - 895
+  - - 1134
+    - 896
+  - - 1135
+    - 903
+  - - 1119
+    - 922
+  - - 1130
+    - 930
+  - - 1153
+    - 927
+  - - 1171
+    - 941
+  - - 1185
+    - 942
+  - - 1200
+    - 920
+  - - 1231
+    - 908
+
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/config/pruned_nozzle_calibration_small.yaml`:
+
+```yaml
+calibration_details: {image_width_px: 1232, image_height_px: 1072, timestamp: '2025-04-29
+    16:32:13', threshold_value: 50, poly_approx_epsilon: 0.01, min_contour_area: 10.0,
+  pruning_timestamp: '2025-05-05 12:06:50', pruning_input_file: nozzle_calibration.yaml}
+nozzles:
+- index: 0
+  spray_pattern_pixels:
+  - [88.0, 901.0]
+  - [160.0, 901.0]
+  - [160.0, 984.0]
+  - [88.0, 984.0]
+- index: 1
+  spray_pattern_pixels:
+  - [160.0, 900.0]
+  - [182.5, 900.0]
+  - [182.5, 950.0]
+  - [160.0, 950.0]
+- index: 2
+  spray_pattern_pixels:
+  - [182.5, 900.0]
+  - [227.25, 900.0]
+  - [227.25, 950.0]
+  - [182.5, 950.0]
+- index: 3
+  spray_pattern_pixels:
+  - [227.25, 880.0]
+  - [282.0, 880.0]
+  - [282.0, 951.0]
+  - [227.25, 951.0]
+- index: 4
+  spray_pattern_pixels:
+  - [282.0, 875.0]
+  - [325.75, 875.0]
+  - [325.75, 952.0]
+  - [282.0, 952.0]
+- index: 5
+  spray_pattern_pixels:
+  - [325.75, 873.0]
+  - [359.75, 873.0]
+  - [359.75, 961.0]
+  - [325.75, 961.0]
+- index: 6
+  spray_pattern_pixels:
+  - [359.75, 884.0]
+  - [407.5, 884.0]
+  - [407.5, 958.0]
+  - [359.75, 958.0]
+- index: 7
+  spray_pattern_pixels:
+  - [407.5, 871.0]
+  - [459.75, 871.0]
+  - [459.75, 967.0]
+  - [407.5, 967.0]
+- index: 8
+  spray_pattern_pixels:
+  - [459.75, 891.0]
+  - [504.5, 891.0]
+  - [504.5, 967.0]
+  - [459.75, 967.0]
+- index: 9
+  spray_pattern_pixels:
+  - [504.5, 878.0]
+  - [546.5, 878.0]
+  - [546.5, 959.0]
+  - [504.5, 959.0]
+- index: 10
+  spray_pattern_pixels:
+  - [546.5, 862.0]
+  - [590.5, 862.0]
+  - [590.5, 949.0]
+  - [546.5, 949.0]
+- index: 11
+  spray_pattern_pixels:
+  - [590.5, 859.0]
+  - [638.25, 859.0]
+  - [638.25, 937.0]
+  - [590.5, 937.0]
+- index: 12
+  spray_pattern_pixels:
+  - [638.25, 864.0]
+  - [682.0, 864.0]
+  - [682.0, 935.0]
+  - [638.25, 935.0]
+- index: 13
+  spray_pattern_pixels:
+  - [682.0, 893.0]
+  - [715.75, 893.0]
+  - [715.75, 969.0]
+  - [682.0, 969.0]
+- index: 14
+  spray_pattern_pixels:
+  - [715.75, 865.0]
+  - [751.25, 865.0]
+  - [751.25, 950.0]
+  - [715.75, 950.0]
+- index: 15
+  spray_pattern_pixels:
+  - [751.25, 884.0]
+  - [802.75, 884.0]
+  - [802.75, 959.0]
+  - [751.25, 959.0]
+- index: 16
+  spray_pattern_pixels:
+  - [802.75, 870.0]
+  - [853.5, 870.0]
+  - [853.5, 939.0]
+  - [802.75, 939.0]
+- index: 17
+  spray_pattern_pixels:
+  - [853.5, 860.0]
+  - [899.0, 860.0]
+  - [899.0, 939.0]
+  - [853.5, 939.0]
+- index: 18
+  spray_pattern_pixels:
+  - [899.0, 870.0]
+  - [939.5, 870.0]
+  - [939.5, 945.0]
+  - [899.0, 945.0]
+- index: 19
+  spray_pattern_pixels:
+  - [939.5, 873.0]
+  - [974.0, 873.0]
+  - [974.0, 958.0]
+  - [939.5, 958.0]
+- index: 20
+  spray_pattern_pixels:
+  - [974.0, 875.0]
+  - [1014.75, 875.0]
+  - [1014.75, 947.0]
+  - [974.0, 947.0]
+- index: 21
+  spray_pattern_pixels:
+  - [1014.75, 847.0]
+  - [1058.25, 847.0]
+  - [1058.25, 937.0]
+  - [1014.75, 937.0]
+- index: 22
+  spray_pattern_pixels:
+  - [1058.25, 872.0]
+  - [1099.25, 872.0]
+  - [1099.25, 950.0]
+  - [1058.25, 950.0]
+- index: 23
+  spray_pattern_pixels:
+  - [1099.25, 882.0]
+  - [1147.25, 882.0]
+  - [1147.25, 952.0]
+  - [1099.25, 952.0]
+- index: 24
+  spray_pattern_pixels:
+  - [1147.25, 873.0]
+  - [1231.0, 873.0]
+  - [1231.0, 942.0]
+  - [1147.25, 942.0]
+
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/config/pruned_nozzle_calibration.yaml`:
+
+```yaml
+calibration_details: {image_width_px: 1232, image_height_px: 1072, timestamp: '2025-04-29
+    16:32:13', threshold_value: 50, poly_approx_epsilon: 0.01, min_contour_area: 10.0,
+  pruning_timestamp: '2025-05-06 12:36:47', pruning_input_file: nozzle_calibration.yaml}
+nozzles:
+- index: 0
+  spray_pattern_pixels:
+  - [176.0, 1802.0]
+  - [320.0, 1802.0]
+  - [320.0, 1968.0]
+  - [176.0, 1968.0]
+- index: 1
+  spray_pattern_pixels:
+  - [320.0, 1800.0]
+  - [365.0, 1800.0]
+  - [365.0, 1900.0]
+  - [320.0, 1900.0]
+- index: 2
+  spray_pattern_pixels:
+  - [365.0, 1800.0]
+  - [454.5, 1800.0]
+  - [454.5, 1900.0]
+  - [365.0, 1900.0]
+- index: 3
+  spray_pattern_pixels:
+  - [454.5, 1760.0]
+  - [564.0, 1760.0]
+  - [564.0, 1902.0]
+  - [454.5, 1902.0]
+- index: 4
+  spray_pattern_pixels:
+  - [564.0, 1750.0]
+  - [651.5, 1750.0]
+  - [651.5, 1904.0]
+  - [564.0, 1904.0]
+- index: 5
+  spray_pattern_pixels:
+  - [651.5, 1746.0]
+  - [719.5, 1746.0]
+  - [719.5, 1922.0]
+  - [651.5, 1922.0]
+- index: 6
+  spray_pattern_pixels:
+  - [719.5, 1768.0]
+  - [815.0, 1768.0]
+  - [815.0, 1916.0]
+  - [719.5, 1916.0]
+- index: 7
+  spray_pattern_pixels:
+  - [815.0, 1742.0]
+  - [919.5, 1742.0]
+  - [919.5, 1934.0]
+  - [815.0, 1934.0]
+- index: 8
+  spray_pattern_pixels:
+  - [919.5, 1782.0]
+  - [1009.0, 1782.0]
+  - [1009.0, 1934.0]
+  - [919.5, 1934.0]
+- index: 9
+  spray_pattern_pixels:
+  - [1009.0, 1756.0]
+  - [1093.0, 1756.0]
+  - [1093.0, 1918.0]
+  - [1009.0, 1918.0]
+- index: 10
+  spray_pattern_pixels:
+  - [1093.0, 1724.0]
+  - [1181.0, 1724.0]
+  - [1181.0, 1898.0]
+  - [1093.0, 1898.0]
+- index: 11
+  spray_pattern_pixels:
+  - [1181.0, 1718.0]
+  - [1276.5, 1718.0]
+  - [1276.5, 1874.0]
+  - [1181.0, 1874.0]
+- index: 12
+  spray_pattern_pixels:
+  - [1276.5, 1728.0]
+  - [1364.0, 1728.0]
+  - [1364.0, 1870.0]
+  - [1276.5, 1870.0]
+- index: 13
+  spray_pattern_pixels:
+  - [1364.0, 1786.0]
+  - [1431.5, 1786.0]
+  - [1431.5, 1938.0]
+  - [1364.0, 1938.0]
+- index: 14
+  spray_pattern_pixels:
+  - [1431.5, 1730.0]
+  - [1502.5, 1730.0]
+  - [1502.5, 1900.0]
+  - [1431.5, 1900.0]
+- index: 15
+  spray_pattern_pixels:
+  - [1502.5, 1768.0]
+  - [1605.5, 1768.0]
+  - [1605.5, 1918.0]
+  - [1502.5, 1918.0]
+- index: 16
+  spray_pattern_pixels:
+  - [1605.5, 1740.0]
+  - [1707.0, 1740.0]
+  - [1707.0, 1878.0]
+  - [1605.5, 1878.0]
+- index: 17
+  spray_pattern_pixels:
+  - [1707.0, 1720.0]
+  - [1798.0, 1720.0]
+  - [1798.0, 1878.0]
+  - [1707.0, 1878.0]
+- index: 18
+  spray_pattern_pixels:
+  - [1798.0, 1740.0]
+  - [1879.0, 1740.0]
+  - [1879.0, 1890.0]
+  - [1798.0, 1890.0]
+- index: 19
+  spray_pattern_pixels:
+  - [1879.0, 1746.0]
+  - [1948.0, 1746.0]
+  - [1948.0, 1916.0]
+  - [1879.0, 1916.0]
+- index: 20
+  spray_pattern_pixels:
+  - [1948.0, 1750.0]
+  - [2029.5, 1750.0]
+  - [2029.5, 1894.0]
+  - [1948.0, 1894.0]
+- index: 21
+  spray_pattern_pixels:
+  - [2029.5, 1694.0]
+  - [2116.5, 1694.0]
+  - [2116.5, 1874.0]
+  - [2029.5, 1874.0]
+- index: 22
+  spray_pattern_pixels:
+  - [2116.5, 1744.0]
+  - [2198.5, 1744.0]
+  - [2198.5, 1900.0]
+  - [2116.5, 1900.0]
+- index: 23
+  spray_pattern_pixels:
+  - [2198.5, 1764.0]
+  - [2294.5, 1764.0]
+  - [2294.5, 1904.0]
+  - [2198.5, 1904.0]
+- index: 24
+  spray_pattern_pixels:
+  - [2294.5, 1746.0]
+  - [2462.0, 1746.0]
+  - [2462.0, 1884.0]
+  - [2294.5, 1884.0]
+
+```
+
+`/home/noerbo/AU/sprayer/AU-SprayerSystem/orei_cam-ws/src/sprayer_system/setup.py`:
+
+```py
+import os
+from glob import glob
+from setuptools import setup, find_packages
+
+package_name = 'sprayer_system'
+
+setup(
+    name=package_name,
+    version='0.1.0',
+    packages=find_packages(exclude=['test']),
+    data_files=[
+        ('share/ament_index/resource_index/packages',
+            ['resource/' + package_name]),
+        ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), glob(os.path.join('launch', '*.launch.py'))),
+        (os.path.join('share', package_name, 'config'), glob(os.path.join('config', '*.yaml'))),
+    ],
+    install_requires=[
+        'setuptools',
+        'rclpy',
+        'PyYAML',
+        'numpy',
+        'pyserial',
+        'opencv-python',
+        ],
+    zip_safe=True,
+    maintainer='Michael Noerbo',
+    maintainer_email='msn@agro.au.dk',
+    description='ROS 2 node for controlling precision spraying.',
+    license='Apache-2.0', 
+    tests_require=['pytest'],
+    entry_points={
+        'console_scripts': [
+            'sprayer_node = sprayer_system.sprayer_node:main',
+        ],
+    },
+)
+```

@@ -26,7 +26,7 @@ sprayer_control_node:
     strategy:
       type: "simple_weed" # Default strategy
       simple_weed:
-        crop_class_names: ["PPPMM", "PIBSA", "BEAVA", "ZEAMX", "SOLTU"]
+        crop_class_names: ["PIBSA", "BEAVA", "ZEAMX", "SOLTU"]
         min_confidence: 0.0
         min_target_coverage_ratio: 1.0 # NOT IMPLEMENTED CURRENTLY
         max_nontarget_overspray_ratio: 1.0 # NOT IMPLEMENTED CURRENTLY

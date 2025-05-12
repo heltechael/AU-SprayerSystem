@@ -65,6 +65,10 @@ class MotionModel:
             self._last_vision_update_time = message_time
             return
 
+        if estimated_dx_px == -200000000.0 and estimated_motion_dy == -200000000.0:
+            self._logger.warn("MotionModel (Vision Update): Received N/A motion estimation. Using last known velocity.")
+            return
+
         dt_duration: Duration = message_time - self._last_vision_update_time
         dt_sec = dt_duration.nanoseconds / 1e9
 
